@@ -16,7 +16,7 @@ import { spawn, exec } from 'node:child_process'
 
 const ILINK_DEFAULT = 'https://ilinkai.weixin.qq.com'
 const ILINK_APP_ID = 'bot' // 官方包注册的 appid，服务端据此识别客户端（缺失会导致投递受限）
-const BOT_AGENT = 'weixin-bot'
+const BOT_AGENT = 'dsh-weixin'
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
 /** iLink-App-ClientVersion：uint32 0x00MMNNPP（major<<16 | minor<<8 | patch） */
@@ -263,7 +263,7 @@ export class WeChatClient {
         msg: {
           from_user_id: '',
           to_user_id: fromUserId,
-          client_id: `weixin-bot-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`,
+          client_id: `dsh-weixin-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`,
           message_type: 2, // BOT 发出
           message_state: 2, // FINISH（完整消息）
           context_token: contextToken,

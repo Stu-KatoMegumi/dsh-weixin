@@ -1,10 +1,10 @@
 // src/plugin/index.mjs — DSH 插件入口（host 平面）
 //
-// 安装后由 $DSH_HOME/cordis.patch.yml 的 weixin-bot 行挂载，随 `pnpm dsh web`
+// 安装后由 $DSH_HOME/cordis.patch.yml 的 dsh-weixin 行挂载，随 `pnpm dsh web`
 // 一起加载。与独立模式共用同一套核心，只是 DSH 传输层换成进程内 apiProxy
 // （不经 HTTP/WebSocket，事件直接消费 apiProxy.events.mux() 的异步迭代器）。
 //
-// 插件配置（cordis.patch.yml 里 weixin-bot 行的 config）：
+// 插件配置（cordis.patch.yml 里 dsh-weixin 行的 config）：
 //   sessionDir     本地 session 目录（建议指向项目文件夹，双方对话落盘处）
 //   sessionCwd     微信会话的工作目录（也是「微信会话」分组的目录）
 //   workspaceTitle 分组显示名，默认「微信会话」
@@ -29,7 +29,7 @@ try {
   PLUGIN_VERSION = JSON.parse(fs.readFileSync(path.join(__dirname, '..', '..', 'version.json'), 'utf8')).version
 } catch { /* 保持默认 */ }
 
-export const name = 'weixin-bot'
+export const name = 'dsh-weixin'
 export const inject = ['apiProxy']
 
 export const Config = z.object({
@@ -58,7 +58,7 @@ export function apply(ctx, config = {}) {
     ...modelConfig(), // 模型路由：简单→flash关思考 / 复杂→pro高思考（可环境变量覆盖）
   }
 
-  console.log(`[weixin-bot] 插件启动: preset=${preset} sessionDir=${sessionDir} 分组=${workspaceTitle}`)
+  console.log(`[dsh-weixin] 插件启动: preset=${preset} sessionDir=${sessionDir} 分组=${workspaceTitle}`)
 
   const wechat = new WeChatClient({
     stateFile: path.join(sessionDir, 'bot.json'),

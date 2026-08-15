@@ -1,6 +1,6 @@
 // src/core/store.mjs — 本地 session/ 持久化
 //
-// 目录结构（默认 D:\Download Files\weixin-bot\session\）：
+// 目录结构（默认 <project>/session/）：
 //   bot.json                 登录 token / baseUrl / get_updates_buf 游标
 //   users.json               微信用户 -> DSH 会话映射
 //   history/<userKey>.jsonl  双方对话镜像：每行 {t, role:'user'|'assistant', text}

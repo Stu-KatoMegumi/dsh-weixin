@@ -1,6 +1,6 @@
-# weixin-bot
+# dsh-weixin
 
-`weixin-bot` 是一个把微信 ClawBot/iLink 官方通道接入 DSH 的桥接器。它接收微信单聊文本，将消息交给 DSH agent，再把结果发送回微信；同一套核心同时支持独立进程和 DSH 插件两种运行方式。
+`dsh-weixin` 是一个把微信 ClawBot/iLink 官方通道接入 DSH 的桥接器。它接收微信单聊文本，将消息交给 DSH agent，再把结果发送回微信；同一套核心同时支持独立进程和 DSH 插件两种运行方式。
 
 ## 架构图
 
@@ -9,7 +9,7 @@ flowchart LR
     U[微信用户<br/>单聊文本]
     IL[ClawBot / iLink<br/>官方通道]
 
-    subgraph BOT[weixin-bot]
+    subgraph BOT[dsh-weixin]
         WC[WeChatClient<br/>登录 · 长轮询 · 分块发送]
         E[Engine<br/>消息过滤 · 模型路由 · 回合编排]
         ST[(session/<br/>token · 用户映射 · 对话历史)]
@@ -105,8 +105,8 @@ npm start
 
 安装脚本会执行以下操作：
 
-1. 将 `src/` 和插件清单复制到 DSH 源码的 `packages/weixin-bot/weixin-bot/`。
-2. 在用户级 `$DSH_HOME/cordis.patch.yml` 追加 `weixin-bot` 挂载配置。
+1. 将 `src/` 和插件清单复制到 DSH 源码的 `packages/dsh-weixin/dsh-weixin/`。
+2. 在用户级 `$DSH_HOME/cordis.patch.yml` 追加 `dsh-weixin` 挂载配置。
 3. 在 DSH 源码根目录执行 `pnpm install`，使 workspace 发现新插件。
 
 执行：
@@ -139,7 +139,13 @@ npm run install -- --force
 
 ### 卸载插件
 
-停止 DSH 后，移除 DSH 源码中的 `packages/weixin-bot/weixin-bot/`，并删除 `$DSH_HOME/cordis.patch.yml` 中由本插件添加的 `id: weixin-bot` 配置块。之后重新启动 DSH 即可。
+停止 DSH 后，在项目根目录执行：
+
+```bash
+npm run uninstall
+```
+
+卸载脚本会移除 DSH 源码中的 `packages/dsh-weixin/`、profile 模块链接和 `$DSH_HOME/cordis.patch.yml` 中由本插件添加的 `id: dsh-weixin` 配置块；随后重新启动 DSH 即可。
 
 ## 配置
 
@@ -213,7 +219,7 @@ session/
 ## 目录结构
 
 ```text
-weixin-bot/
+dsh-weixin/
 ├── package.json             # 项目元数据与 npm scripts
 ├── version.json             # 插件安装版本
 ├── install.mjs              # 安装/更新 DSH 插件

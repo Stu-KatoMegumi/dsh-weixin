@@ -36,7 +36,7 @@ async function ilink(pathname, body, timeoutMs = 20000) {
 }
 
 console.log('=== 上线通知 notifyStart ===')
-const ns = await ilink('/ilink/bot/msg/notifystart', { base_info: { channel_version: version, bot_agent: 'weixin-bot' } })
+const ns = await ilink('/ilink/bot/msg/notifystart', { base_info: { channel_version: version, bot_agent: 'dsh-weixin' } })
 console.log(JSON.stringify(ns))
 
 console.log('\n=== sendmessage（完整协议头 + context_token 省略）===')
@@ -49,6 +49,6 @@ const send = await ilink('/ilink/bot/sendmessage', {
     message_state: 2,
     item_list: [{ type: 1, text_item: { text: '[投递测试] 如果你在微信看到这条，说明修复生效了' } }],
   },
-  base_info: { channel_version: version, bot_agent: 'weixin-bot' },
+  base_info: { channel_version: version, bot_agent: 'dsh-weixin' },
 })
 console.log(JSON.stringify(send, null, 2))

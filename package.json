@@ -1,5 +1,5 @@
 {
-  "name": "weixin-bot",
+  "name": "dsh-weixin",
   "version": "1.0.0",
   "private": true,
   "type": "module",
@@ -9,6 +9,7 @@
   },
   "scripts": {
     "start": "node src/standalone/main.mjs",
-    "install": "node install.mjs"
+    "install": "node install.mjs",
+    "uninstall": "node install.mjs --uninstall"
   }
 }

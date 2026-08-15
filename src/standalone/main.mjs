@@ -50,7 +50,7 @@ const transport = new HttpTransport({
 const engine = new Engine({ wechat, store, transport, config })
 
 console.log('┌──────────────────────────────────────────────────────┐')
-console.log('│  weixin-bot（独立模式）                                │')
+console.log('│  dsh-weixin（独立模式）                                │')
 console.log('│  DSH:      ' + config.dshBase.padEnd(39) + '│')
 console.log('│  preset:   ' + config.preset.padEnd(39) + '│')
 console.log('│  session:  ' + sessionDir.padEnd(39) + '│')
