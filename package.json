@@ -1,0 +1,13 @@
+{
+  "name": "weixin-bot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "ClawBot（微信官方 iLink 通道）↔ DSH 桥：微信联系人消息透传到 DeepSeek Harness 会话并回复",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node bridge.mjs"
+  }
+}
