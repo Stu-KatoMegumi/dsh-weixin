@@ -61,6 +61,9 @@ export function registerControlApi(webServer, engine, wechat) {
         else if (method === 'settings.update') value = engine.updateSettings(body?.patch)
         else if (method === 'login.start') value = { url: await wechat.beginRenewal(null) }
         else if (method === 'errors') value = engine.store.readErrors(Math.min(100, Number(body?.limit || 20)))
+        else if (method === 'prompt.list') value = engine.listPrompts()
+        else if (method === 'prompt.save') value = engine.savePrompt(body?.name, body?.content)
+        else if (method === 'prompt.reset') value = engine.resetPrompt(body?.name)
         else return writeJson(response, 404, { ok: false, error: { message: `unknown method: ${method}` } })
         return writeJson(response, 200, { ok: true, value })
       } catch (error) {

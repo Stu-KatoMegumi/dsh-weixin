@@ -3,6 +3,7 @@ import path from 'node:path'
 import { formatQuestions } from './wechat.mjs'
 import { safeTextCut } from './format.mjs'
 import { cronMatches, minuteKey } from './scheduler.mjs'
+import { PROMPT_FILES, ensurePromptFiles, renderPrompt, readPromptFile, writePromptFile, resetPromptFile, editablePromptDir } from './prompt.mjs'
 
 const ACTION_RE = /(写|改|创建|生成|删除|移动|复制|运行|执行|启动|停止|安装|下载|上传|搜索|查询|查找|分析|总结|整理|重构|调试|测试|构建|打包|部署|提交|推送|合并|克隆|备份|翻译|转换|解压|代码|脚本|命令|文件|项目|docker|git|npm|pnpm|node|python|pip|ssh|sql|api)/i
 
@@ -26,6 +27,33 @@ function within(root, candidate) {
   return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative))
 }
 
+/**
+ * Extract the consumable text from one inbound iLink message.
+ * Mirrors the official openclaw-weixin semantics: the first consumable item
+ * wins — a text item (type 1) with quoted context, then voice transcription
+ * (type 3, voice_item.text). Item types are compared numerically so string
+ * serialized enums are tolerated.
+ */
+export function extractMessageText(msg) {
+  for (const item of msg?.item_list || []) {
+    const type = Number(item?.type)
+    if (type === 1 && item?.text_item?.text) {
+      const text = String(item.text_item.text)
+      const ref = item.ref_msg
+      if (!ref) return text
+      const refItem = ref.message_item
+      const refIsText = refItem && Number(refItem.type) === 1 && refItem.text_item?.text
+      const parts = []
+      if (ref.title) parts.push(String(ref.title))
+      if (refIsText) parts.push(String(refItem.text_item.text))
+      if (!parts.length) return text
+      return `[引用: ${parts.join(' | ')}]\n${text}`
+    }
+    if (type === 3 && item?.voice_item?.text) return String(item.voice_item.text)
+  }
+  return ''
+}
+
 export function normalizeConfig(config = {}) {
   return {
     enabled: bool(config.enabled, true),
@@ -38,8 +66,9 @@ export function normalizeConfig(config = {}) {
     admins: stringList(config.admins),
     slowAckMs: Number(config.slowAckMs ?? 4000),
     turnTimeoutMs: Number(config.turnTimeoutMs ?? 15 * 60 * 1000),
-    streamFlushChars: Math.max(40, Number(config.streamFlushChars ?? 240)),
-    streamFlushMs: Math.max(100, Number(config.streamFlushMs ?? 900)),
+    // streamFlushChars = 单气泡长度上限；streamFlushMs = 空闲超时（无新内容自动发）
+    streamFlushChars: Math.max(200, Number(config.streamFlushChars ?? 1500)),
+    streamFlushMs: Math.max(500, Number(config.streamFlushMs ?? 3000)),
     maintenanceIntervalMs: Math.max(10_000, Number(config.maintenanceIntervalMs ?? 60_000)),
     complexAckText: String(config.complexAckText || '好的，我先思考一下，稍后给你结果。'),
     fastModel: config.fastModel ?? null,
@@ -66,7 +95,13 @@ export function modelConfig(env = process.env) {
   }
 }
 
-class StreamRelay {
+/**
+ * 流式回复 → 微信气泡的中继。
+ * 主规则：LLM 输出双回车（空行）即视为一个气泡结束，立即发送（双回车不进文案）。
+ * 兜底 1（flushChars）：单个气泡达到长度上限时，在最近的换行/标点处强制切分。
+ * 兜底 2（flushMs）：收到内容后超过 flushMs 没有新内容，强制发出当前气泡，避免“没反应”。
+ */
+export class StreamRelay {
   constructor({ wechat, to, token, enabled, flushChars, flushMs }) {
     this.wechat = wechat
     this.to = to
@@ -85,23 +120,54 @@ class StreamRelay {
     if (!this.enabled || !delta) return
     this.buffer += delta
     this.all += delta
+    this.#splitOnBlankLine()
+    if (!this.buffer) return
     if (this.buffer.length >= this.flushChars) this.flush(false)
-    else if (!this.timer) this.timer = setTimeout(() => this.flush(true), this.flushMs)
+    else this.#arm()
+  }
+
+  /** 主规则：双回车（空行）即切气泡。 */
+  #splitOnBlankLine() {
+    let index
+    while ((index = this.buffer.indexOf('\n\n')) >= 0) {
+      const part = this.buffer.slice(0, index)
+      this.buffer = this.buffer.slice(index + 2)
+      this.#sendPart(part)
+    }
   }
 
   flush(force) {
     clearTimeout(this.timer)
     this.timer = null
     if (!this.buffer) return
-    let count = this.buffer.length
-    if (!force && count < this.flushChars) return this.#arm()
-    if (!force) count = safeTextCut(this.buffer, this.flushChars)
+    if (!force && this.buffer.length < this.flushChars) return this.#arm()
+    const count = force ? this.buffer.length : safeTextCut(this.buffer, this.flushChars)
     const part = this.buffer.slice(0, count)
     this.buffer = this.buffer.slice(count)
-    if (!part.trim()) return this.#arm()
+    this.#sendPart(part)
+    if (this.buffer) this.#arm()
+  }
+
+  /** 发送一个气泡；异常的超长段（超过上限）再按上限切分。 */
+  #sendPart(part) {
+    const trimmed = part.trim()
+    if (!trimmed) return
+    if (trimmed.length <= this.flushChars) {
+      this.#send(trimmed)
+      return
+    }
+    let remaining = trimmed
+    while (remaining) {
+      const count = safeTextCut(remaining, this.flushChars)
+      const piece = remaining.slice(0, count)
+      remaining = remaining.slice(count)
+      if (piece.trim()) this.#send(piece.trim())
+    }
+  }
+
+  #send(part) {
     this.sent = true
     this.chain = this.chain.then(() => this.wechat.sendText(this.to, this.token, part))
-    if (this.buffer) this.#arm()
   }
 
   #arm() {
@@ -118,12 +184,16 @@ class StreamRelay {
 }
 
 export class Engine {
-  constructor({ wechat, store, transport, config = {} }) {
+  constructor({ wechat, store, transport, config = {}, promptDir = null, defaultPromptDir = null }) {
     this.wechat = wechat
     this.store = store
     this.transport = transport
     this.baseConfig = { ...config }
     this.config = normalizeConfig({ ...config, ...store.loadSettings() })
+    // 可定制 prompt：可编辑副本位于频道数据目录，默认文件位于项目 src/prompt/
+    this.promptDir = promptDir || editablePromptDir(store.dir)
+    this.defaultPromptDir = defaultPromptDir || path.join(process.cwd(), 'src', 'prompt')
+    ensurePromptFiles(this.defaultPromptDir, this.promptDir)
     this.userBySession = new Map()
     this.started = false
     this.maintenanceTimer = null
@@ -200,8 +270,9 @@ export class Engine {
       return
     }
 
-    const textItem = msg.item_list?.find(item => item.type === 1 && item.text_item?.text)
-    let text = String(textItem?.text || '').trim()
+    const itemTypes = (msg.item_list || []).map(item => item?.type ?? '?').join(',') || 'none'
+    let text = extractMessageText(msg).trim()
+    console.log(`[engine] 收到 ${userKey} 消息（item: ${itemTypes}${msg.message_state != null ? `，state: ${msg.message_state}` : ''}）${text ? `: ${text.slice(0, 80)}` : '（无文本）'}`)
     let media = []
     if (this.config.mediaEnabled) media = await this.wechat.downloadMedia(msg, userKey)
     if (media.length) {
@@ -209,6 +280,7 @@ export class Engine {
       text = `${text}${text ? '\n\n' : ''}用户从微信发来了以下附件，请根据需要读取和处理：\n${attachmentText}`
     }
     if (!text) {
+      console.warn(`[engine] ${userKey} 的消息无法提取文本（item 类型: ${itemTypes}，message_state: ${msg.message_state ?? '?'}）`)
       await this.wechat.sendText(userKey, contextToken, this.config.mediaEnabled
         ? '暂时无法识别这条消息。'
         : '当前已关闭媒体接收，请发送文字。')
@@ -217,6 +289,7 @@ export class Engine {
 
     try {
       const record = await this.#ensureUser(userKey, contextToken)
+      console.log(`[engine] ${userKey} -> 会话 ${record.sessionId}`)
       if (text.startsWith('/')) {
         await this.#command(userKey, contextToken, record.sessionId, text)
         return
@@ -263,7 +336,7 @@ export class Engine {
       flushMs: this.config.streamFlushMs,
     })
     try {
-      const reply = await this.transport.ask(sessionId, text, {
+      const reply = await this.transport.ask(sessionId, this.#buildPromptMessage(text), {
         timeoutMs: this.config.turnTimeoutMs,
         slowMs: complex ? 0 : this.config.slowAckMs,
         onDelta: delta => relay.push(delta),
@@ -273,6 +346,41 @@ export class Engine {
     } finally {
       if (this.config.typing) await this.wechat.setTyping(userKey, contextToken, false)
     }
+  }
+
+  /** 把可定制 prompt 渲染后拼到用户消息前（每次读取，改文件即热生效）。 */
+  #buildPromptMessage(text) {
+    const prompt = renderPrompt(this.promptDir)
+    if (!prompt) return text
+    return [
+      '[系统设定（来自 dsh-weixin 定制，非用户输入，请始终遵守）]',
+      prompt,
+      '[设定结束]',
+      '',
+      `用户消息：\n${text}`,
+    ].join('\n')
+  }
+
+  /** 设置页控制 API：prompt 文件列表（含内容与是否默认）。 */
+  listPrompts() {
+    return {
+      dir: this.promptDir,
+      files: PROMPT_FILES.map(name => ({
+        name,
+        content: readPromptFile(this.promptDir, name) ?? '',
+        isDefault: (readPromptFile(this.promptDir, name) ?? '') === (readPromptFile(this.defaultPromptDir, name) ?? ''),
+      })),
+    }
+  }
+
+  savePrompt(name, content) {
+    writePromptFile(this.promptDir, name, content)
+    return { name, saved: true }
+  }
+
+  resetPrompt(name) {
+    resetPromptFile(this.defaultPromptDir, this.promptDir, name)
+    return { name, reset: true }
   }
 
   async #command(userKey, token, sessionId, input) {

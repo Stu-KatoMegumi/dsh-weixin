@@ -1,6 +1,6 @@
 {
   "name": "@deepseek-ai/dsh-weixin",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "type": "module",
   "description": "微信 iLink 通道与 DSH 的流式智能代理插件",
   "main": "./src/plugin/index.mjs",

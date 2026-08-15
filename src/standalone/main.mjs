@@ -2,10 +2,12 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { installTimestampLogging } from '../core/log.mjs'
+import { loadEnvFile } from '../core/envfile.mjs'
 import { WeChatClient } from '../core/wechat.mjs'
 import { Store } from '../core/store.mjs'
 import { Engine, modelConfig } from '../core/engine.mjs'
 import { HttpTransport } from '../dsh/http.mjs'
+import { defaultPromptDir, editablePromptDir } from '../core/prompt.mjs'
 
 installTimestampLogging()
 
@@ -13,6 +15,8 @@ const dirname = path.dirname(fileURLToPath(import.meta.url))
 const projectDir = path.resolve(dirname, '../..')
 const sessionCwd = path.resolve(process.env.WX_BOT_CWD || projectDir)
 const sessionDir = path.resolve(process.env.WX_BOT_SESSION_DIR || path.join(sessionCwd, 'session'))
+// config/.env 仅服务独立模式：进程环境变量优先，.env 只补充缺失项
+loadEnvFile(path.join(projectDir, 'config', '.env'))
 const list = value => String(value || '').split(/[\s,;]+/).filter(Boolean)
 const flag = (value, fallback = true) => value == null ? fallback : !['0', 'false', 'off'].includes(String(value).toLowerCase())
 let version = '1.0.1'
@@ -33,8 +37,8 @@ const config = {
   admins: list(process.env.WX_BOT_ADMINS),
   slowAckMs: Number(process.env.WX_BOT_SLOW_ACK_MS || 4000),
   turnTimeoutMs: Number(process.env.WX_BOT_TURN_TIMEOUT_MS || 15 * 60 * 1000),
-  streamFlushChars: Number(process.env.WX_BOT_STREAM_FLUSH_CHARS || 240),
-  streamFlushMs: Number(process.env.WX_BOT_STREAM_FLUSH_MS || 900),
+  streamFlushChars: Number(process.env.WX_BOT_STREAM_FLUSH_CHARS || 1500),
+  streamFlushMs: Number(process.env.WX_BOT_STREAM_FLUSH_MS || 3000),
   outboxDir: path.resolve(process.env.WX_BOT_OUTBOX_DIR || path.join(sessionCwd, 'outbox')),
   ...modelConfig(),
 }
@@ -69,7 +73,14 @@ if (dshReady) {
     watchdogMs: Number(process.env.WX_BOT_WATCHDOG_MS || 90_000),
     version,
   })
-  const engine = new Engine({ wechat, store, transport, config })
+  const engine = new Engine({
+    wechat,
+    store,
+    transport,
+    config,
+    promptDir: editablePromptDir(sessionDir),
+    defaultPromptDir: defaultPromptDir(projectDir),
+  })
 
   console.log(`[dsh-weixin] v${version} 独立模式`)
   console.log(`[dsh-weixin] DSH=${config.dshBase} sessionDir=${sessionDir}`)

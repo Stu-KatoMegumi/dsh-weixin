@@ -9,6 +9,7 @@ import { Store } from '../core/store.mjs'
 import { Engine, modelConfig } from '../core/engine.mjs'
 import { InprocTransport } from '../dsh/inproc.mjs'
 import { registerControlApi } from './control.mjs'
+import { defaultPromptDir, editablePromptDir } from '../core/prompt.mjs'
 
 installTimestampLogging()
 
@@ -43,8 +44,8 @@ export const Config = z.object({
   renewalEnabled: z.boolean().default(true),
   slowAckMs: z.number().default(4000),
   turnTimeoutMs: z.number().default(15 * 60 * 1000),
-  streamFlushChars: z.number().default(240),
-  streamFlushMs: z.number().default(900),
+  streamFlushChars: z.number().default(1500),
+  streamFlushMs: z.number().default(3000),
   chunkSize: z.number().default(1800),
   pollTimeoutMs: z.number().default(5000),
   watchdogMs: z.number().default(90_000),
@@ -87,7 +88,14 @@ export function apply(ctx, config = {}) {
     timeoutMs: engineConfig.turnTimeoutMs,
     slowMs: engineConfig.slowAckMs,
   })
-  const engine = new Engine({ wechat, store, transport, config: engineConfig })
+  const engine = new Engine({
+    wechat,
+    store,
+    transport,
+    config: engineConfig,
+    promptDir: editablePromptDir(sessionDir),
+    defaultPromptDir: defaultPromptDir(projectDir),
+  })
 
   console.log(`[dsh-weixin] v${pluginVersion} 加载：sessionDir=${sessionDir} preset=${preset}`)
   ctx.effect(() => {

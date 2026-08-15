@@ -12,6 +12,8 @@ function workspaceFor(items, cwd, title) {
     || items.find((item) => item.title === title)
 }
 
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
+
 export class HttpTransport extends BaseTransport {
   constructor({
     base = 'http://127.0.0.1:3080',
@@ -19,6 +21,7 @@ export class HttpTransport extends BaseTransport {
     sessionCwd = process.cwd(),
     workspaceTitle = '微信会话',
     fetchImpl = globalThis.fetch,
+    muxReconnectMs = 1000,
     ...options
   } = {}) {
     super(options)
@@ -27,8 +30,10 @@ export class HttpTransport extends BaseTransport {
     this.sessionCwd = sessionCwd
     this.workspaceTitle = workspaceTitle
     this.fetch = fetchImpl
+    this.muxReconnectMs = Math.max(100, muxReconnectMs)
     this.abortController = null
     this.streamTask = null
+    this.stallReported = false
   }
 
   async call(method, payload, { signal } = {}) {
@@ -61,48 +66,106 @@ export class HttpTransport extends BaseTransport {
     return response.json().catch(() => ({ accepted: false, reason: 'bad-response' }))
   }
 
+  /**
+   * DSH serves the mux event channel over WebSocket only: plain GET SSE on
+   * /api/events.mux is answered with HTTP 426 "upgrade required". The server
+   * pushes one JSON frame per event: {type:'server-request', rpcId, method,
+   * payload}, where payload is the MuxFrame consumed by _handleEnvelope.
+   */
   _startStream() {
     this.abortController = new AbortController()
     const signal = this.abortController.signal
-    this.streamTask = (async () => {
-      try {
-        const response = await this.fetch(`${this.base}/api/events.mux`, { signal, headers: { accept: 'text/event-stream' } })
-        if (!response.ok || !response.body) throw new Error(`DSH event stream failed: HTTP ${response.status}`)
-        const reader = response.body.getReader()
-        const decoder = new TextDecoder()
-        let buffer = ''
-        while (!signal.aborted) {
-          const { done, value } = await reader.read()
-          if (done) break
-          buffer += decoder.decode(value, { stream: true })
-          let boundary
-          while ((boundary = buffer.indexOf('\n\n')) >= 0) {
-            const chunk = buffer.slice(0, boundary)
-            buffer = buffer.slice(boundary + 2)
-            const data = chunk.split(/\r?\n/)
-              .filter((line) => line.startsWith('data: '))
-              .map((line) => line.slice(6))
-              .join('')
-            if (!data) continue
-            try {
-              const full = JSON.parse(data)
-              this._handleEnvelope({ rpcId: full.rpcId, payload: full.payload })
-            } catch (error) {
-              console.warn('[dsh-weixin] 丢弃格式错误的 DSH 事件:', error.message)
-            }
-          }
-        }
-        await reader.cancel().catch(() => {})
-      } catch (error) {
-        if (!signal.aborted) this.onStall(error?.message || 'DSH 事件流已断开')
-      }
-    })()
+    this.streamTask = this.#runMuxStream(signal)
+    void this.streamTask.catch(error => {
+      if (!signal.aborted) this.onStall(error?.message || 'DSH 事件流失败')
+    })
   }
 
   _stopStream() {
     this.abortController?.abort()
     this.abortController = null
     this.streamTask = null
+  }
+
+  async #runMuxStream(signal) {
+    if (typeof WebSocket !== 'function') {
+      throw new Error('当前 Node 版本不支持 WebSocket（需要 >= 22），无法连接 DSH 事件流')
+    }
+    const wsBase = this.base.replace(/^http:/, 'ws:').replace(/^https:/, 'wss:')
+    let backoff = this.muxReconnectMs
+    while (!signal.aborted) {
+      let socket
+      try {
+        socket = await this.#openMux(wsBase, signal)
+        backoff = this.muxReconnectMs
+        this.stallReported = false
+        await this.#pumpMux(socket, signal)
+        if (signal.aborted) return
+        throw new Error('DSH event stream closed')
+      } catch (error) {
+        if (signal.aborted) return
+        try { socket?.close() } catch { /* already closed */ }
+        const message = error?.message || 'DSH 事件流已断开'
+        if (!this.stallReported) {
+          this.stallReported = true
+          this.onStall(message)
+        } else {
+          console.warn(`[dsh-weixin] DSH 事件流重连中（${Math.ceil(backoff / 1000)} 秒后重试）: ${message}`)
+        }
+        await sleep(backoff)
+        backoff = Math.min(30_000, backoff * 2)
+      }
+    }
+  }
+
+  async #openMux(wsBase, signal) {
+    const socket = new WebSocket(`${wsBase}/api/events.mux`)
+    const abortOnSignal = () => { try { socket.close() } catch { /* ignore */ } }
+    signal.addEventListener('abort', abortOnSignal)
+    try {
+      await new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error('DSH event stream open timed out')), 15_000)
+        socket.onopen = () => { clearTimeout(timeout); resolve() }
+        socket.onerror = () => { clearTimeout(timeout); reject(new Error('DSH event stream failed to open')) }
+        socket.onclose = () => { clearTimeout(timeout); reject(new Error('DSH event stream closed before open')) }
+        if (socket.readyState === WebSocket.CLOSING || socket.readyState === WebSocket.CLOSED) {
+          clearTimeout(timeout)
+          reject(new Error('DSH event stream closed before open'))
+        }
+      })
+      socket.onopen = null
+      socket.onerror = null
+      socket.onclose = null
+      signal.removeEventListener('abort', abortOnSignal)
+      return socket
+    } catch (error) {
+      signal.removeEventListener('abort', abortOnSignal)
+      try { socket.close() } catch { /* ignore */ }
+      throw error
+    }
+  }
+
+  #pumpMux(socket, signal) {
+    return new Promise((resolve) => {
+      const abortOnSignal = () => { try { socket.close() } catch { /* ignore */ } }
+      signal.addEventListener('abort', abortOnSignal)
+      const cleanup = () => {
+        socket.onmessage = null
+        socket.onclose = null
+        socket.onerror = null
+        signal.removeEventListener('abort', abortOnSignal)
+      }
+      socket.onmessage = (event) => {
+        if (typeof event.data !== 'string' || !event.data) return
+        try {
+          this._handleEnvelope(JSON.parse(event.data))
+        } catch (error) {
+          console.warn('[dsh-weixin] 丢弃格式错误的 DSH 事件:', error?.message ?? error)
+        }
+      }
+      socket.onerror = () => { /* close always follows */ }
+      socket.onclose = () => { cleanup(); resolve() }
+    })
   }
 
   async _ensureSession(userKey, { fresh = false, sessionId: requestedId } = {}) {

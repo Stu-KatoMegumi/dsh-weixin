@@ -1,10 +1,13 @@
+# 开发人员：STU-XIE
+
 # dsh-weixin
 
-`dsh-weixin` 把微信 iLink/ClawBot 私聊接入 DSH agent。插件模式直接使用 DSH `apiProxy`，独立模式通过 DSH Web HTTP + SSE 连接。
+`dsh-weixin` 把微信 iLink/ClawBot 私聊接入 DSH agent。插件模式直接使用 DSH `apiProxy`，独立模式通过 DSH Web HTTP RPC + WebSocket 事件流连接。
 
 ## 功能
 
-- DSH 事件流增量输出，按字符数/时间分段回传微信
+- 流式回复按模型分段：空行（双回车）= 新气泡，长度/空闲超时自动兜底
+- Prompt 定制：system-prompt / soul / rules / memory 四个文件，网页表单编辑即时生效
 - 微信“正在输入”状态，任务结束自动关闭
 - 长轮询看门狗、指数退避重连和连接状态记录
 - 登录约 24 小时到期前生成新二维码，旧 token 在扫码前继续工作
@@ -76,9 +79,31 @@ cron 按运行 DSH 的本地时区解析，五个字段依次是分、时、日�
 npm start
 ```
 
-默认连接 `http://127.0.0.1:3080`。可使用 `DSH_URL`、`WX_BOT_CWD`、`WX_BOT_SESSION_DIR`、`WX_BOT_PRESET`、`WX_BOT_ACCESS_POLICY`、`WX_BOT_ALLOWLIST`、`WX_BOT_ADMINS`、`WX_BOT_STREAMING`、`WX_BOT_TYPING` 等环境变量。
+默认连接 `http://127.0.0.1:3080`。配置集中放在 `config/.env`（参考 `config/.env.example`，该文件不进入版本库）：进程已有的环境变量优先，`.env` 只补充缺失项；`DSH_URL`、`WX_BOT_CWD`、`WX_BOT_SESSION_DIR`、`WX_BOT_PRESET`、`WX_BOT_ACCESS_POLICY`、`WX_BOT_ALLOWLIST`、`WX_BOT_ADMINS`、`WX_BOT_STREAMING`、`WX_BOT_TYPING` 等均可在其中配置。
 
 独立模式会在启动微信连接前调用只读 DSH API 检查服务。如果 DSH 未启动、地址错误或端口上不是 DSH，程序会提示先运行 `pnpm dsh web` 并以退出码 1 结束，不会启动扫码和微信轮询。检测超时默认为 3000 ms，可用 `DSH_STARTUP_CHECK_TIMEOUT_MS` 调整。
+
+## 气泡与流式输出
+
+回复按以下规则分成多条微信消息（气泡），主规则由模型决定：
+
+- **空行（双回车）= 一个气泡结束**：模型在输出中用空行分段，程序把空行前的内容立即作为一条消息发送（空行本身不进入微信文案）。此契约写在 `src/prompt/system-prompt.md`，可在设置页修改。
+- **长度兜底**：单个气泡超过 `streamFlushChars`（默认 1500 字符）时，在最近的换行/标点处强制切分。
+- **空闲兜底**：模型超过 `streamFlushMs`（默认 3000 ms）没有新内容时，强制发出当前气泡，避免“没反应”。
+
+## Prompt 定制（人设 / 规则 / 记忆）
+
+项目自带默认 prompt 文件：
+
+```text
+src/prompt/
+  system-prompt.md   系统设定与气泡契约
+  soul.md            人设与灵魂
+  rules.md           行为规则
+  memory.md          背景记忆（静态，人工维护）
+```
+
+首次启动会把默认文件复制到频道数据目录（插件模式 `$DSH_HOME/channels/dsh-weixin/prompt/`，独立模式 `session/prompt/`），之后在 DSH“设置 → 微信”页面的 **Prompt 定制** 区编辑这些副本（保存/重置默认），修改对下一条消息即时生效。渲染后的 prompt 会在每次请求前注入给模型，支持 `{date}` 占位符（当前日期）。
 
 ## 开发验证
 

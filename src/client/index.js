@@ -103,13 +103,71 @@ window.__ModuleLoader__.load({
           h(Field, { title: '白名单（每行一个用户 ID）' }, h('textarea', { style: { ...input, minHeight: 88 }, value: draft.allowlistText, onChange: event => set('allowlistText', event.target.value) })),
           h(Field, { title: '管理员（每行一个用户 ID）' }, h('textarea', { style: { ...input, minHeight: 88 }, value: draft.adminsText, onChange: event => set('adminsText', event.target.value) }))),
         h('div', { style: row },
-          h(Field, { title: '流式分段字符数' }, h('input', { style: input, type: 'number', value: draft.streamFlushChars, onChange: event => set('streamFlushChars', event.target.value) })),
-          h(Field, { title: '流式刷新间隔（ms）' }, h('input', { style: input, type: 'number', value: draft.streamFlushMs, onChange: event => set('streamFlushMs', event.target.value) })),
+          h(Field, { title: '单气泡长度上限（字符，超限强制切分）' }, h('input', { style: input, type: 'number', value: draft.streamFlushChars, onChange: event => set('streamFlushChars', event.target.value) })),
+          h(Field, { title: '空闲超时（ms，无新内容自动发出）' }, h('input', { style: input, type: 'number', value: draft.streamFlushMs, onChange: event => set('streamFlushMs', event.target.value) })),
           h(Field, { title: '慢任务提示延迟（ms）' }, h('input', { style: input, type: 'number', value: draft.slowAckMs, onChange: event => set('slowAckMs', event.target.value) })),
           h(Field, { title: '单轮超时（ms）' }, h('input', { style: input, type: 'number', value: draft.turnTimeoutMs, onChange: event => set('turnTimeoutMs', event.target.value) }))),
+        h('div', { style: { fontSize: 12, opacity: 0.7, marginBottom: 14 } },
+          '气泡规则：模型输出空行（双回车）即结束一个气泡；超过长度上限或空闲超时也会自动切分。'),
         h(Field, { title: '定时任务 JSON（id / cron / userId / prompt / enabled）' },
           h('textarea', { style: { ...input, minHeight: 130, fontFamily: 'monospace' }, value: draft.jobsText, onChange: event => set('jobsText', event.target.value) })),
         h('button', { type: 'button', disabled: busy, onClick: save, style: { ...input, width: 'auto', cursor: 'pointer', background: '#2878d0', color: '#fff', border: 0 } }, busy ? '处理中…' : '保存设置'),
+        h(PromptEditor, { api, busy }),
+        message ? h('div', { style: { marginTop: 10, fontSize: 13 } }, message) : null,
+      )
+    }
+
+    const promptMeta = [
+      { name: 'system-prompt.md', label: '系统设定', hint: '总纲与气泡契约（空行=新气泡），修改后下一条消息生效' },
+      { name: 'soul.md', label: '人设与灵魂', hint: '性格、语气、价值观' },
+      { name: 'rules.md', label: '行为规则', hint: '硬性规则与禁区' },
+      { name: 'memory.md', label: '背景记忆', hint: '静态背景知识，人工维护' },
+    ]
+
+    function PromptEditor({ api, busy }) {
+      const [prompts, setPrompts] = useState(null)
+      const [message, setMessage] = useState('')
+      const [saving, setSaving] = useState('')
+      const load = useCallback(async () => {
+        try { setPrompts(await api('prompt.list')) } catch (error) { setMessage(error.message) }
+      }, [api])
+      useEffect(() => { void load() }, [load])
+      if (!prompts) return h('div', { style: { marginTop: 22 } }, '正在读取 prompt 文件…')
+      return h('div', { style: { marginTop: 22, borderTop: '1px solid var(--dsw-alias-border-strong, #e2e6ec)', paddingTop: 16 } },
+        h('h3', { style: { margin: '0 0 4px', fontSize: 14 } }, 'Prompt 定制'),
+        h('div', { style: { fontSize: 12, opacity: 0.7, marginBottom: 12 } },
+          `编辑目录：${prompts.dir}。首次启动已从项目默认文件复制，此处修改即时生效（下一条消息开始）。`),
+        prompts.files.map(entry => {
+          const meta = promptMeta.find(item => item.name === entry.name) || { name: entry.name, label: entry.name, hint: '' }
+          return h('div', { key: entry.name, style: { marginBottom: 16 } },
+            h('div', { style: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 } },
+              h('label', { style: { fontSize: 13, fontWeight: 600 } }, meta.label),
+              h('span', { style: { fontSize: 11, opacity: 0.6 } }, entry.name),
+              entry.isDefault ? h('span', { style: { fontSize: 11, color: '#258750' } }, '（默认内容）') : null),
+            h('div', { style: { fontSize: 12, opacity: 0.7, marginBottom: 4 } }, meta.hint),
+            h('textarea', { style: { ...input, minHeight: 130, fontFamily: 'monospace', fontSize: 12 }, value: entry.content, onChange: event => {
+              setPrompts(current => ({ ...current, files: current.files.map(item => item.name === entry.name ? { ...item, content: event.target.value } : item) }))
+            } }),
+            h('div', { style: { display: 'flex', gap: 8, marginTop: 6 } },
+              h('button', { type: 'button', disabled: busy || saving === entry.name, onClick: async () => {
+                setSaving(entry.name)
+                try {
+                  await api('prompt.save', { name: entry.name, content: entry.content })
+                  setMessage(`已保存 ${entry.name}。`)
+                  await load()
+                } catch (error) { setMessage(`保存失败：${error.message}`) } finally { setSaving('') }
+              }, style: { ...input, width: 'auto', cursor: 'pointer' } }, '保存'),
+              h('button', { type: 'button', disabled: busy || saving === entry.name, onClick: async () => {
+                setSaving(entry.name)
+                try {
+                  await api('prompt.reset', { name: entry.name })
+                  setMessage(`已重置 ${entry.name} 为默认内容。`)
+                  await load()
+                } catch (error) { setMessage(`重置失败：${error.message}`) } finally { setSaving('') }
+              }, style: { ...input, width: 'auto', cursor: 'pointer' } }, '重置默认'),
+            ),
+          )
+        }),
         message ? h('div', { style: { marginTop: 10, fontSize: 13 } }, message) : null,
       )
     }
