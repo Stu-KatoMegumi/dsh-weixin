@@ -103,6 +103,8 @@ export class WeChatClient {
     renewWarnBeforeMs = DEFAULT_RENEW_WARN_MS,
     version = '1.0.0',
     log = console.log,
+    warn = console.warn,
+    error = console.error,
   }) {
     this.stateFile = stateFile
     this.mediaDir = mediaDir
@@ -112,8 +114,10 @@ export class WeChatClient {
     this.renewAfterMs = renewAfterMs
     this.renewWarnBeforeMs = renewWarnBeforeMs
     this.version = version
-    this.clientVersion = buildClientVersion(version)
     this.log = log
+    this.warn = warn
+    this.error = error
+    this.clientVersion = buildClientVersion(version)
     this.state = this.#loadState()
     this.token = this.state.botToken || ''
     this.baseUrl = this.state.baseUrl || ILINK_DEFAULT
@@ -219,7 +223,7 @@ export class WeChatClient {
         if (value.status === 'expired' || value.status === 'cancelled') throw new Error('二维码已失效')
       } catch (error) {
         if (signal.aborted || this.stopped || error?.message === '二维码已失效') throw error
-        console.warn('[wechat] 查询扫码状态失败，将继续重试:', error.message)
+        this.warn('[wechat] 查询扫码状态失败，将继续重试:', error.message)
       }
       await sleep(1000)
     }
@@ -274,26 +278,38 @@ export class WeChatClient {
     const qr = await this.#newQrCode()
     this.#persistQr(qr.url)
     const controller = new AbortController()
-    this.renewal = { ...qr, controller, startedAt: Date.now(), recipient, lastReminderAt: Date.now() }
+    this.renewal = { ...qr, controller, startedAt: Date.now(), recipient, lastReminderAt: Date.now(), scanClose: null }
+    // When no recipient can carry the link (settings page / auto-renewal), open
+    // a dedicated scan app-window so the server holds the handle and can close
+    // it automatically right after the scan succeeds. openScanWindow returns a
+    // `{ close }` handle; fall back to the default browser when no browser is
+    // available (that window then closes on its own as the user leaves it).
+    if (!recipient && open) {
+      const scan = openScanWindow(qr.url)
+      this.renewal.scanClose = scan?.close || null
+      if (!scan) openUrl(qr.url)
+    }
     void this.#pollQr(qr, controller.signal).then(async (value) => {
+      const closeScan = this.renewal?.scanClose
+      if (typeof closeScan === 'function') {
+        try { closeScan() } catch { /* window already gone */ }
+      }
       this.#acceptCredentials(value)
       this.renewal = null
       if (recipient) await this.sendText(recipient, this.state.contextTokens?.[recipient] || '', '✅ 微信连接续期成功。')
     }).catch((error) => {
-      if (!controller.signal.aborted) console.warn('[wechat] 续期未完成:', error.message)
+      // Keep swallowing errors silently when the polling was intentionally cancelled.
+      if (this.renewal?.scanClose) {
+        try { this.renewal.scanClose() } catch { /* ignore */ }
+      }
+      if (!controller.signal.aborted) this.warn('[wechat] 续期未完成:', error.message)
       this.renewal = null
     })
     if (notify && recipient && this.token) {
       const token = this.state.contextTokens?.[recipient] || ''
       await this.sendText(recipient, token, `🔐 微信登录凭据即将到期，请打开下面链接扫码续期：\n${qr.url}`).catch(error => {
-        console.warn('[wechat] 续期提醒发送失败:', error.message)
+        this.warn('[wechat] 续期提醒发送失败:', error.message)
       })
-    } else if (!recipient && open) {
-      // Only the caller that owns the window should open the QR URL. The
-      // settings page hands the URL back to the browser page which opens it
-      // itself (open:false), while auto-renewal with no recipient opens the
-      // default browser once on the machine running the bot (open:true).
-      openUrl(qr.url)
     }
     return qr.url
   }
@@ -337,17 +353,17 @@ export class WeChatClient {
         if (!this.notified) await this.notifyStart()
         const startedAt = Date.now()
         const messages = await this.pollOnce()
-        if (Date.now() - startedAt > this.watchdogMs) console.warn('[wechat] 长轮询响应过慢，已进入下一轮监听')
+        if (Date.now() - startedAt > this.watchdogMs) this.warn('[wechat] 长轮询响应过慢，已进入下一轮监听')
         for (const message of messages) {
           if (this.stopped) return
-          void Promise.resolve(handler(message)).catch(error => console.error('[wechat] 消息处理失败:', error.message))
+          void Promise.resolve(handler(message)).catch(error => this.error('[wechat] 消息处理失败:', error.message))
         }
         backoff = 1000
       } catch (error) {
         if (this.stopped) return
         this.lastError = error
         this.notified = false
-        console.warn(`[wechat] 连接异常，${Math.ceil(backoff / 1000)} 秒后重试：${error.message}`)
+        this.warn(`[wechat] 连接异常，${Math.ceil(backoff / 1000)} 秒后重试：${error.message}`)
         await sleep(backoff)
         backoff = Math.min(30_000, backoff * 2)
       }
@@ -407,7 +423,7 @@ export class WeChatClient {
       }, { timeoutMs: 15_000 })
     } catch (error) {
       this.typingTickets.delete(userId)
-      console.warn('[wechat] typing 状态发送失败:', error.message)
+      this.warn('[wechat] typing 状态发送失败:', error.message)
     }
   }
 
@@ -439,7 +455,7 @@ export class WeChatClient {
         const result = await downloadInboundItem(item, saveDir)
         if (result) results.push(result)
       } catch (error) {
-        console.warn('[wechat] 媒体下载失败:', error.message)
+        this.warn('[wechat] 媒体下载失败:', error.message)
       }
     }
     return results
@@ -448,6 +464,9 @@ export class WeChatClient {
   stop() {
     this.stopped = true
     this.#closeScan()
+    if (this.renewal?.scanClose) {
+      try { this.renewal.scanClose() } catch { /* ignore */ }
+    }
     this.renewal?.controller.abort()
     this.renewal = null
     void this.notifyStop()

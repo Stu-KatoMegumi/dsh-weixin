@@ -20,3 +20,16 @@ export function installTimestampLogging() {
     console[level] = (...args) => original(`[${stamp()}]`, ...args)
   }
 }
+
+/** Create a scoped logger. When `enabled` is false every call is a no-op, so a
+ *  plugin can be silent without overriding the shared global `console` — which
+ *  also carries the host's own output (e.g. the `dsh web: http://...` banner). */
+export function createLogger(enabled = true) {
+  const noop = () => {}
+  const reflect = level => (...args) => { console[level](...args) }
+  return {
+    log: enabled ? reflect('log') : noop,
+    warn: enabled ? reflect('warn') : noop,
+    error: enabled ? reflect('error') : noop,
+  }
+}

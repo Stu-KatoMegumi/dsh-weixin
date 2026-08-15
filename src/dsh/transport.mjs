@@ -43,9 +43,10 @@ function eventTurn(event) {
 
 /** Shared event/turn coordinator used by the in-process and HTTP adapters. */
 export class BaseTransport {
-  constructor({ timeoutMs = DEFAULT_TIMEOUT, slowMs = DEFAULT_SLOW } = {}) {
+  constructor({ timeoutMs = DEFAULT_TIMEOUT, slowMs = DEFAULT_SLOW, logger = null } = {}) {
     this.timeoutMs = timeoutMs
     this.slowMs = slowMs
+    this.logger = logger || { log: console.log, warn: console.warn, error: console.error }
     this.started = false
     this.lastSeq = new Map()
     this.turns = new Map()
@@ -214,7 +215,7 @@ export class BaseTransport {
         for (const waiter of this.waiters.values()) {
           if (waiter.sessionId === sessionId && Number(event.seq ?? 0) > waiter.baseline) {
             try { waiter.onDelta?.(delta, state.text) } catch (error) {
-              console.warn('[dsh-weixin] stream consumer failed:', error?.message ?? error)
+              this.logger.warn('[dsh-weixin] stream consumer failed:', error?.message ?? error)
             }
           }
         }

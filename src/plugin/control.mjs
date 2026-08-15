@@ -59,10 +59,10 @@ export function registerControlApi(webServer, engine, wechat) {
         let value
         if (method === 'status') value = engine.status()
         else if (method === 'settings.update') value = engine.updateSettings(body?.patch)
-        // open:false keeps the browser hand-off in the page that requested the
-        // QR. The server must not also invoke openUrl, or the settings page
-        // would pop two scan windows (one via the host, one via window.open).
-        else if (method === 'login.start') value = { url: await wechat.beginRenewal(null, { open: false }) }
+        // open (default) so the server opens a dedicated scan app-window that
+        // it can close automatically once the login/renewal scan succeeds. The
+        // settings page must not open a second window of its own.
+        else if (method === 'login.start') value = { url: await wechat.beginRenewal(null) }
         else if (method === 'errors') value = engine.store.readErrors(Math.min(100, Number(body?.limit || 20)))
         else if (method === 'prompt.list') value = engine.listPrompts()
         else if (method === 'prompt.save') value = engine.savePrompt(body?.name, body?.content)

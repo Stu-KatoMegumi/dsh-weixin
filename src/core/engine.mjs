@@ -184,10 +184,15 @@ export class StreamRelay {
 }
 
 export class Engine {
-  constructor({ wechat, store, transport, config = {}, promptDir = null, defaultPromptDir = null }) {
+  constructor({ wechat, store, transport, config = {}, promptDir = null, defaultPromptDir = null, logger = null }) {
     this.wechat = wechat
     this.store = store
     this.transport = transport
+    this.logger = logger || {
+      log: (...args) => console.log(...args),
+      warn: (...args) => console.warn(...args),
+      error: (...args) => console.error(...args),
+    }
     this.baseConfig = { ...config }
     this.config = normalizeConfig({ ...config, ...store.loadSettings() })
     // 可定制 prompt：可编辑副本位于频道数据目录，默认文件位于项目 src/prompt/
@@ -206,7 +211,7 @@ export class Engine {
     this.started = true
     this.transport.onQuestion = (rpcId, sessionId, questions) => this.#forwardQuestion(rpcId, sessionId, questions)
     this.transport.onSlow = sessionId => this.#slowAck(sessionId)
-    this.transport.onStall = value => console.warn('[engine] DSH 通道告警:', value)
+    this.transport.onStall = value => this.logger.warn('[engine] DSH 通道告警:', value)
     this.transport.start()
     this.maintenanceTimer = setInterval(() => void this.#maintenance(), this.config.maintenanceIntervalMs)
     this.maintenanceTimer.unref?.()
@@ -216,11 +221,11 @@ export class Engine {
   async #startWechat() {
     try {
       await this.wechat.ensureLogin()
-      console.log('[engine] 微信通道已启动，正在接收消息')
+      this.logger.log('[engine] 微信通道已启动，正在接收消息')
       await this.wechat.startPolling(message => this.handleWechatMessage(message))
     } catch (error) {
       this.store.appendError('wechat.start', error)
-      console.error('[engine] 微信通道启动失败:', error.message)
+      this.logger.error('[engine] 微信通道启动失败:', error.message)
     }
   }
 
@@ -272,7 +277,7 @@ export class Engine {
 
     const itemTypes = (msg.item_list || []).map(item => item?.type ?? '?').join(',') || 'none'
     let text = extractMessageText(msg).trim()
-    console.log(`[engine] 收到 ${userKey} 消息（item: ${itemTypes}${msg.message_state != null ? `，state: ${msg.message_state}` : ''}）${text ? `: ${text.slice(0, 80)}` : '（无文本）'}`)
+    this.logger.log(`[engine] 收到 ${userKey} 消息（item: ${itemTypes}${msg.message_state != null ? `，state: ${msg.message_state}` : ''}）${text ? `: ${text.slice(0, 80)}` : '（无文本）'}`)
     let media = []
     if (this.config.mediaEnabled) media = await this.wechat.downloadMedia(msg, userKey)
     if (media.length) {
@@ -280,7 +285,7 @@ export class Engine {
       text = `${text}${text ? '\n\n' : ''}用户从微信发来了以下附件，请根据需要读取和处理：\n${attachmentText}`
     }
     if (!text) {
-      console.warn(`[engine] ${userKey} 的消息无法提取文本（item 类型: ${itemTypes}，message_state: ${msg.message_state ?? '?'}）`)
+      this.logger.warn(`[engine] ${userKey} 的消息无法提取文本（item 类型: ${itemTypes}，message_state: ${msg.message_state ?? '?'}）`)
       await this.wechat.sendText(userKey, contextToken, this.config.mediaEnabled
         ? '暂时无法识别这条消息。'
         : '当前已关闭媒体接收，请发送文字。')
@@ -289,7 +294,7 @@ export class Engine {
 
     try {
       const record = await this.#ensureUser(userKey, contextToken)
-      console.log(`[engine] ${userKey} -> 会话 ${record.sessionId}`)
+      this.logger.log(`[engine] ${userKey} -> 会话 ${record.sessionId}`)
       if (text.startsWith('/')) {
         await this.#command(userKey, contextToken, record.sessionId, text)
         return
@@ -297,7 +302,7 @@ export class Engine {
       await this.#runTurn(userKey, contextToken, record.sessionId, text)
     } catch (error) {
       this.store.appendError('message', error, { userKey })
-      console.error('[engine] 消息处理失败:', error.message)
+      this.logger.error('[engine] 消息处理失败:', error.message)
       await this.wechat.setTyping(userKey, contextToken, false)
       await this.wechat.sendText(userKey, contextToken, `处理失败：${error.message}`).catch(() => {})
     }
@@ -460,7 +465,7 @@ export class Engine {
   async #selectModel(sessionId, spec) {
     if (!spec) return
     try { await this.transport.selectModel(sessionId, spec) } catch (error) {
-      console.warn(`[engine] 模型切换失败，继续使用当前模型：${error.message}`)
+      this.logger.warn(`[engine] 模型切换失败，继续使用当前模型：${error.message}`)
     }
   }
 
@@ -475,7 +480,7 @@ export class Engine {
 
   #forwardQuestion(rpcId, sessionId, questions) {
     const user = this.#userOf(sessionId)
-    if (!user) return console.warn(`[engine] 会话 ${sessionId} 的提问无法定位微信用户`)
+    if (!user) return this.logger.warn(`[engine] 会话 ${sessionId} 的提问无法定位微信用户`)
     void this.wechat.sendText(user.from, user.token, formatQuestions(questions)).catch(error => {
       this.store.appendError('question.forward', error, { sessionId })
     })

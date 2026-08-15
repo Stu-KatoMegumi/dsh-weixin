@@ -77,9 +77,8 @@ window.__ModuleLoader__.load({
       const login = async () => {
         setBusy(true)
         try {
-          const value = await api('login.start')
-          if (value.url) window.open(value.url, '_blank', 'noopener,noreferrer')
-          setMessage('已生成扫码链接，请在新窗口完成扫码。')
+          await api('login.start')
+          setMessage('已弹出扫码窗口，完成扫码后窗口将自动关闭。')
         } catch (error) { setMessage(`生成二维码失败：${error.message}`) } finally { setBusy(false) }
       }
       if (!draft) return h('div', null, '正在读取 dsh-weixin 状态…')

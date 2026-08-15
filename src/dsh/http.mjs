@@ -110,7 +110,7 @@ export class HttpTransport extends BaseTransport {
           this.stallReported = true
           this.onStall(message)
         } else {
-          console.warn(`[dsh-weixin] DSH 事件流重连中（${Math.ceil(backoff / 1000)} 秒后重试）: ${message}`)
+          this.logger.warn(`[dsh-weixin] DSH 事件流重连中（${Math.ceil(backoff / 1000)} 秒后重试）: ${message}`)
         }
         await sleep(backoff)
         backoff = Math.min(30_000, backoff * 2)
@@ -160,7 +160,7 @@ export class HttpTransport extends BaseTransport {
         try {
           this._handleEnvelope(JSON.parse(event.data))
         } catch (error) {
-          console.warn('[dsh-weixin] 丢弃格式错误的 DSH 事件:', error?.message ?? error)
+          this.logger.warn('[dsh-weixin] 丢弃格式错误的 DSH 事件:', error?.message ?? error)
         }
       }
       socket.onerror = () => { /* close always follows */ }

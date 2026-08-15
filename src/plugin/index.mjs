@@ -3,15 +3,13 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import z from '@deepseek-ai/schemastery'
-import { installTimestampLogging } from '../core/log.mjs'
+import { createLogger } from '../core/log.mjs'
 import { WeChatClient } from '../core/wechat.mjs'
 import { Store } from '../core/store.mjs'
 import { Engine, modelConfig } from '../core/engine.mjs'
 import { InprocTransport } from '../dsh/inproc.mjs'
 import { registerControlApi } from './control.mjs'
 import { defaultPromptDir, editablePromptDir } from '../core/prompt.mjs'
-
-installTimestampLogging()
 
 const dirname = path.dirname(fileURLToPath(import.meta.url))
 const projectDir = path.resolve(dirname, '../..')
@@ -62,6 +60,10 @@ export function apply(ctx, config = {}) {
     config.sessionDir || process.env.WX_BOT_SESSION_DIR || path.join(dshHome, 'channels', 'dsh-weixin'),
   )
   const preset = config.preset || process.env.WX_BOT_PRESET || 'standard'
+  // 插件模式与 DSH 共享同一个进程，绝不能覆盖 DSH 的全局 console（否则会连 DSH
+  // 自己的 `dsh web: http://...` 启动横幅一起吞掉）。这里给插件自己的组件注入一个
+  // 静默 logger，只对插件自身输出生效；需要排查时请改用独立模式 `npm start`。
+  const silent = createLogger(false)
   const engineConfig = {
     ...config,
     sessionCwd,
@@ -80,6 +82,9 @@ export function apply(ctx, config = {}) {
     renewAfterMs: config.renewAfterMs ?? 24 * 60 * 60 * 1000,
     renewWarnBeforeMs: config.renewWarnBeforeMs ?? 2 * 60 * 60 * 1000,
     version: pluginVersion,
+    log: silent.log,
+    warn: silent.warn,
+    error: silent.error,
   })
   const transport = new InprocTransport(ctx.apiProxy, {
     preset,
@@ -87,6 +92,7 @@ export function apply(ctx, config = {}) {
     workspaceTitle: config.workspaceTitle || '微信会话',
     timeoutMs: engineConfig.turnTimeoutMs,
     slowMs: engineConfig.slowAckMs,
+    logger: silent,
   })
   const engine = new Engine({
     wechat,
@@ -95,9 +101,9 @@ export function apply(ctx, config = {}) {
     config: engineConfig,
     promptDir: editablePromptDir(sessionDir),
     defaultPromptDir: defaultPromptDir(projectDir),
+    logger: silent,
   })
 
-  console.log(`[dsh-weixin] v${pluginVersion} 加载：sessionDir=${sessionDir} preset=${preset}`)
   ctx.effect(() => {
     engine.start()
     return () => engine.stop()

@@ -35,7 +35,9 @@ pnpm dsh --profile web --dump-config
 pnpm dsh --profile web
 ```
 
-首次启动会打开扫码窗口。登录凭据、会话映射和设置默认持久保存在 `$DSH_HOME/channels/dsh-weixin`（通常是 `~/.dsh/channels/dsh-weixin`），更新或卸载插件不会删除它。
+首次启动会打开扫码窗口（独立应用窗口，扫码成功后自动关闭）。登录凭据、会话映射和设置默认持久保存在 `$DSH_HOME/channels/dsh-weixin`（通常是 `~/.dsh/channels/dsh-weixin`），更新或卸载插件不会删除它。
+
+> **插件模式不输出日志**：dsh-weixin 由 DSH 加载时给自身组件注入静默 logger（不动 DSH 自己的 `console`，因此 DSH 的启动横幅、状态输出等都保持正常）；插件自身的收发/扫码日志不打印到 DSH 终端。扫码/续期窗口在 DSH 所在机器上用独立应用窗口弹出，扫码成功后自动关闭。需要完整日志排查时请改用独立模式 `npm start`。
 
 ## 卸载
 
