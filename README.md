@@ -47,7 +47,9 @@ weixin-bot/
 npm start
 ```
 
-首次运行自动打开浏览器（`session/qrcode.txt` 存有登录链接），微信扫码登录后即可对话。
+首次运行会用 **Edge/Chrome 的独立应用窗口**直接打开微信官方扫码页（无中间步骤、无点击，
+`session/qrcode.txt` 存有登录链接备用），**扫码登录成功后该窗口自动关闭**；
+未找到 Edge/Chrome 时降级为默认浏览器打开（需手动关闭）。
 环境变量（均可选）：`DSH_URL`、`WX_BOT_PRESET`（默认 `weixin`）、`WX_BOT_SESSION_DIR`、
 `WX_BOT_CWD`、`WX_BOT_SLOW_ACK_MS`（默认 4000）、`WX_BOT_TURN_TIMEOUT_MS`、
 `WX_BOT_CHUNK_SIZE`、`WX_BOT_POLL_TIMEOUT_MS`（长轮询期望超时，默认 5000）。

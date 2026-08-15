@@ -9,6 +9,7 @@
 // 无第三方依赖，Node >= 22（全局 fetch）。
 
 import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import { spawn, exec } from 'node:child_process'
 
@@ -51,6 +52,7 @@ export class WeChatClient {
     this.token = this.state.botToken
     this.baseUrl = this.state.baseUrl || ILINK_DEFAULT
     this.stopped = false
+    this.scanClose = null // 扫码窗口关闭句柄（登录完成后自动关闭）
   }
 
   // ── 状态持久化 ──
@@ -109,10 +111,15 @@ export class WeChatClient {
     try { fs.rmSync(path.join(path.dirname(this.stateFile), 'qrcode.png'), { force: true }) } catch { /* 清理 */ }
     if (qrUrl) {
       fs.writeFileSync(path.join(path.dirname(this.stateFile), 'qrcode.txt'), qrUrl + '\n')
-      this.log('[wechat] 登录链接已保存到 session/qrcode.txt')
-      this.log('[wechat] 正在打开浏览器（若无反应，请手动打开上面的链接）…')
-      if (!openBrowser(qrUrl)) this.log('[wechat] 自动打开失败，请手动打开:', qrUrl)
-      this.log('[wechat] 在打开的页面里用微信扫码即可完成登录；也可把链接发到手机微信里打开')
+      this.log('[wechat] 登录链接已保存到 session/qrcode.txt（也可发到手机微信里打开）')
+      // 直接用 Edge/Chrome 的 --app 独立窗口打开扫码页：登录成功后自动关闭该窗口
+      this.log('[wechat] 正在打开扫码窗口（扫码登录成功后会自动关闭）…')
+      const scan = openScanWindow(qrUrl)
+      this.scanClose = scan ? scan.close : null
+      if (!scan) {
+        this.log('[wechat] 未找到 Edge/Chrome，改用默认浏览器打开（登录后需手动关闭页面）')
+        if (!openBrowser(qrUrl)) this.log('[wechat] 自动打开失败，请手动打开:', qrUrl)
+      }
     } else {
       this.log('[wechat] 接口未返回登录链接，二维码票据:', qr.qrcode)
     }
@@ -125,15 +132,17 @@ export class WeChatClient {
           `${ILINK_DEFAULT}/ilink/bot/get_qrcode_status?qrcode=${encodeURIComponent(qr.qrcode)}`,
         ).then((r) => r.json())
         if (st.status === 'confirmed') {
+          this.#closeScan()
           this.token = st.bot_token
           this.baseUrl = st.baseurl || ILINK_DEFAULT
           this.state.botToken = this.token
           this.state.baseUrl = this.baseUrl
           this.#saveState()
-          this.log('[wechat] 登录成功 ✓')
+          this.log('[wechat] 登录成功 ✓（扫码窗口已自动关闭）')
           return true
         }
         if (st.status === 'expired' || st.status === 'cancelled') {
+          this.#closeScan()
           throw new Error('二维码已失效，请重新运行')
         }
         this.log(`[wechat] 等待扫码确认（${new Date().toLocaleTimeString()}）…`)
@@ -142,6 +151,13 @@ export class WeChatClient {
         console.warn(`[wechat] 轮询扫码状态出错，3 秒后重试: ${error.message}`)
         await sleep(3000)
       }
+    }
+  }
+
+  #closeScan() {
+    if (this.scanClose) {
+      try { this.scanClose() } catch { /* 已关闭 */ }
+      this.scanClose = null
     }
   }
 
@@ -212,7 +228,70 @@ export class WeChatClient {
 
   stop() {
     this.stopped = true
+    this.#closeScan()
   }
+}
+
+// ── 扫码窗口：Edge/Chrome 的 --app 独立窗口，登录成功后 kill 进程即自动关闭 ──
+
+const EDGE_PATHS = [
+  'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
+  'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
+  path.join(process.env.LOCALAPPDATA || '', 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
+].filter(Boolean)
+
+const CHROME_PATHS = [
+  'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+  'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+  path.join(process.env.LOCALAPPDATA || '', 'Google', 'Chrome', 'Application', 'chrome.exe'),
+].filter(Boolean)
+
+/**
+ * 用浏览器的 --app 模式打开独立扫码窗口：
+ *  - 只显示扫码页的独立窗口（无标签页/地址栏），直接可扫，无中间步骤
+ *  - 带独立 --user-data-dir：该窗口是独立进程树，close() 可随时将其关闭
+ * 环境变量 WX_BOT_BROWSER 可指定浏览器可执行文件路径。
+ * @param {string} qrUrl 微信官方登录页 URL
+ * @returns {{ close: () => void, browser: string } | null} 失败返回 null（调用方降级默认浏览器）
+ */
+export function openScanWindow(qrUrl) {
+  const candidates = [process.env.WX_BOT_BROWSER, ...EDGE_PATHS, ...CHROME_PATHS].filter(Boolean)
+  for (const browser of candidates) {
+    if (!fs.existsSync(browser)) continue
+    let profile = ''
+    try {
+      profile = fs.mkdtempSync(path.join(os.tmpdir(), 'wx-login-'))
+      const child = spawn(browser, [
+        `--app=${qrUrl}`,
+        `--user-data-dir=${profile}`,
+        '--no-first-run',
+        '--no-default-browser-check',
+      ], { stdio: 'ignore' })
+      let closed = false
+      const close = () => {
+        if (closed) return
+        closed = true
+        try { child.kill() } catch { /* 已退出 */ }
+        // 清理临时配置目录（进程退出后文件锁可能延迟释放，重试几次）
+        let attempts = 0
+        const tryClean = () => {
+          attempts += 1
+          try {
+            fs.rmSync(profile, { recursive: true, force: true })
+          } catch {
+            if (attempts < 5) setTimeout(tryClean, 1000)
+          }
+        }
+        setTimeout(tryClean, 2000)
+      }
+      child.on('error', close)
+      child.on('exit', close)
+      return { close, browser }
+    } catch {
+      try { if (profile) fs.rmSync(profile, { recursive: true, force: true }) } catch { /* 忽略 */ }
+    }
+  }
+  return null
 }
 
 /** 把 agent 的提问整理成一条微信消息 */
