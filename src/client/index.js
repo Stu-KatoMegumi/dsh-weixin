@@ -107,7 +107,7 @@ window.__ModuleLoader__.load({
           h(Field, { title: '慢任务提示延迟（ms）' }, h('input', { style: input, type: 'number', value: draft.slowAckMs, onChange: event => set('slowAckMs', event.target.value) })),
           h(Field, { title: '单轮超时（ms）' }, h('input', { style: input, type: 'number', value: draft.turnTimeoutMs, onChange: event => set('turnTimeoutMs', event.target.value) }))),
         h('div', { style: { fontSize: 12, opacity: 0.7, marginBottom: 14 } },
-          '气泡规则：模型输出空行（双回车）即结束一个气泡；超过长度上限或空闲超时也会自动切分。'),
+          '气泡规则：模型输出三个连续换行（\n\n\n）即结束当前气泡并开始下一条；单/双换行只是段落排版。长度上限按当前气泡累计，超过或空闲超时也会自动切分。'),
         h(Field, { title: '定时任务 JSON（id / cron / userId / prompt / enabled）' },
           h('textarea', { style: { ...input, minHeight: 130, fontFamily: 'monospace' }, value: draft.jobsText, onChange: event => set('jobsText', event.target.value) })),
         h('button', { type: 'button', disabled: busy, onClick: save, style: { ...input, width: 'auto', cursor: 'pointer', background: '#2878d0', color: '#fff', border: 0 } }, busy ? '处理中…' : '保存设置'),

@@ -120,18 +120,20 @@ export class StreamRelay {
     if (!this.enabled || !delta) return
     this.buffer += delta
     this.all += delta
-    this.#splitOnBlankLine()
+    this.#splitOnBubbleBreak()
     if (!this.buffer) return
+    // 长度上限只统计“当前这个气泡”从它开始到现在积累的字符数——每次切出一个
+    // 气泡后 buffer 都会被重置为下一个气泡的开头，不会从整条回复的头部累计。
     if (this.buffer.length >= this.flushChars) this.flush(false)
     else this.#arm()
   }
 
-  /** 主规则：双回车（空行）即切气泡。 */
-  #splitOnBlankLine() {
+  /** 主规则：三个连续换行（两个空行）即切出一个气泡。单/双换行只是段落排版，不会触发切分。 */
+  #splitOnBubbleBreak() {
     let index
-    while ((index = this.buffer.indexOf('\n\n')) >= 0) {
+    while ((index = this.buffer.indexOf('\n\n\n')) >= 0) {
       const part = this.buffer.slice(0, index)
-      this.buffer = this.buffer.slice(index + 2)
+      this.buffer = this.buffer.slice(index + 3)
       this.#sendPart(part)
     }
   }

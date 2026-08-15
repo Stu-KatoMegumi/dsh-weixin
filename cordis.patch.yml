@@ -3,4 +3,4 @@
       name: '@deepseek-ai/dsh-weixin'
       config:
         preset: standard
-        workspaceTitle: 微信DSH
+        workspaceTitle: dsh-weixin
