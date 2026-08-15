@@ -33,14 +33,14 @@ export const name = 'weixin-bot'
 export const inject = ['apiProxy']
 
 export const Config = z.object({
-  sessionDir: z.string().optional(),
-  sessionCwd: z.string().optional(),
-  workspaceTitle: z.string().optional(),
-  preset: z.string().optional(),
-  slowAckMs: z.number().optional(),
-  turnTimeoutMs: z.number().optional(),
-  chunkSize: z.number().optional(),
-  pollTimeoutMs: z.number().optional(),
+  sessionDir: z.string(),
+  sessionCwd: z.string(),
+  workspaceTitle: z.string(),
+  preset: z.string(),
+  slowAckMs: z.number(),
+  turnTimeoutMs: z.number(),
+  chunkSize: z.number(),
+  pollTimeoutMs: z.number(),
 })
 
 export function apply(ctx, config = {}) {

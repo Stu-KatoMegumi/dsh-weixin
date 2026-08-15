@@ -60,7 +60,9 @@ if (!fs.existsSync(DSH_ROOT)) {
   fail(`找不到 DSH 源码目录 ${DSH_ROOT}，请设置环境变量 DSH_ROOT 指向你的 DSH 源码根`)
 }
 
-const targetDir = path.join(DSH_ROOT, 'packages', 'weixin-bot')
+// DSH's workspace pattern is packages/*/*, so the plugin needs two directory levels.
+const legacyTargetDir = path.join(DSH_ROOT, 'packages', 'weixin-bot')
+const targetDir = path.join(legacyTargetDir, 'weixin-bot')
 const targetVersionFile = path.join(targetDir, 'version.json')
 let targetVersion = null
 try {
@@ -75,6 +77,10 @@ if (targetVersion !== null) console.log(`[install] 检测到旧版本 v${targetV
 
 // ── 2. 复制插件到 DSH packages/ ──
 
+// Migrate the earlier single-level installation, which pnpm did not recognize as a workspace package.
+if (fs.existsSync(path.join(legacyTargetDir, 'package.json'))) {
+  fs.rmSync(legacyTargetDir, { recursive: true, force: true })
+}
 fs.rmSync(targetDir, { recursive: true, force: true })
 fs.mkdirSync(targetDir, { recursive: true })
 fs.cpSync(path.join(projectDir, 'src'), path.join(targetDir, 'src'), { recursive: true })
@@ -86,6 +92,25 @@ const pluginManifest = JSON.parse(
 pluginManifest.version = version
 fs.writeFileSync(path.join(targetDir, 'package.json'), JSON.stringify(pluginManifest, null, 2) + '\n')
 fs.copyFileSync(path.join(projectDir, 'version.json'), targetVersionFile)
+
+// DSH resolves plugins using the profile directory as the module anchor.
+// Register this in-box workspace package in the profile fallback so it is
+// resolvable from every profile (for example ~/.dsh/profiles/web).
+const profilePackageLink = path.join(DSH_HOME, 'profiles', 'node_modules', '@deepseek-ai', 'dsh-weixin-bot')
+fs.mkdirSync(path.dirname(profilePackageLink), { recursive: true })
+let keepProfileLink = false
+try {
+  const stat = fs.lstatSync(profilePackageLink)
+  if (!stat.isSymbolicLink()) {
+    fail(`Plugin resolution path is occupied by a non-link directory: ${profilePackageLink}`)
+  }
+  keepProfileLink = fs.realpathSync(profilePackageLink) === fs.realpathSync(targetDir)
+  if (!keepProfileLink) fs.unlinkSync(profilePackageLink)
+} catch (error) {
+  if (error?.code !== 'ENOENT') throw error
+}
+if (!keepProfileLink) fs.symlinkSync(targetDir, profilePackageLink, 'junction')
+console.log(`[install] Linked plugin into DSH profile module fallback: ${profilePackageLink}`)
 console.log(`[install] 已复制插件到 ${targetDir}`)
 
 // ── 3. $DSH_HOME/cordis.patch.yml 挂载行 ──
