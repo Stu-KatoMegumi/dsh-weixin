@@ -67,8 +67,8 @@ export function normalizeConfig(config = {}) {
     slowAckMs: Number(config.slowAckMs ?? 4000),
     turnTimeoutMs: Number(config.turnTimeoutMs ?? 15 * 60 * 1000),
     // streamFlushChars = 单气泡长度上限；streamFlushMs = 空闲超时（无新内容自动发）
-    streamFlushChars: Math.max(200, Number(config.streamFlushChars ?? 1500)),
-    streamFlushMs: Math.max(500, Number(config.streamFlushMs ?? 3000)),
+    streamFlushChars: Math.max(200, Number(config.streamFlushChars ?? 2000)),
+    streamFlushMs: Math.max(500, Number(config.streamFlushMs ?? 8000)),
     maintenanceIntervalMs: Math.max(10_000, Number(config.maintenanceIntervalMs ?? 60_000)),
     complexAckText: String(config.complexAckText || '好的，我先思考一下，稍后给你结果。'),
     fastModel: config.fastModel ?? null,
@@ -102,13 +102,14 @@ export function modelConfig(env = process.env) {
  * 兜底 2（flushMs）：收到内容后超过 flushMs 没有新内容，强制发出当前气泡，避免“没反应”。
  */
 export class StreamRelay {
-  constructor({ wechat, to, token, enabled, flushChars, flushMs }) {
+  constructor({ wechat, to, token, enabled, flushChars, flushMs, logger = null }) {
     this.wechat = wechat
     this.to = to
     this.token = token
     this.enabled = enabled
     this.flushChars = flushChars
     this.flushMs = flushMs
+    this.logger = logger
     this.buffer = ''
     this.all = ''
     this.sent = false
@@ -169,7 +170,11 @@ export class StreamRelay {
 
   #send(part) {
     this.sent = true
-    this.chain = this.chain.then(() => this.wechat.sendText(this.to, this.token, part))
+    // 串行保持顺序；单条发送失败绝不外抛成 unhandled rejection（否则 Node 会直接
+    // 让 DSH 进程退出），只记录并继续发送后续气泡。
+    this.chain = this.chain
+      .then(() => this.wechat.sendText(this.to, this.token, part))
+      .catch(error => { this.logger?.warn?.('[relay] 消息发送失败:', error?.message ?? error) })
   }
 
   #arm() {
@@ -180,8 +185,18 @@ export class StreamRelay {
     clearTimeout(this.timer)
     this.timer = null
     if (this.enabled) this.flush(true)
-    await this.chain
-    if (!this.sent) await this.wechat.sendText(this.to, this.token, finalText || '（DSH 没有返回文本内容）')
+    try {
+      await this.chain
+    } catch (error) {
+      this.logger?.warn?.('[relay] 收尾发送失败:', error?.message ?? error)
+    }
+    if (!this.sent) {
+      try {
+        await this.wechat.sendText(this.to, this.token, finalText || '（DSH 没有返回文本内容）')
+      } catch (error) {
+        this.logger?.warn?.('[relay] 兜底消息发送失败:', error?.message ?? error)
+      }
+    }
   }
 }
 
@@ -341,6 +356,7 @@ export class Engine {
       enabled: this.config.streaming,
       flushChars: this.config.streamFlushChars,
       flushMs: this.config.streamFlushMs,
+      logger: this.logger,
     })
     try {
       const reply = await this.transport.ask(sessionId, this.#buildPromptMessage(text), {

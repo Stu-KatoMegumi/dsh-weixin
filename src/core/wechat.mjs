@@ -96,8 +96,8 @@ export class WeChatClient {
   constructor({
     stateFile,
     mediaDir = path.join(path.dirname(stateFile), 'media'),
-    chunkSize = 1800,
-    pollTimeoutMs = 5000,
+    chunkSize = 2000,
+    pollTimeoutMs = 8000,
     watchdogMs = 90_000,
     renewAfterMs = DEFAULT_RENEW_AFTER_MS,
     renewWarnBeforeMs = DEFAULT_RENEW_WARN_MS,
