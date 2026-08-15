@@ -50,9 +50,26 @@ npm start
 首次运行会用 **Edge/Chrome 的独立应用窗口**直接打开微信官方扫码页（无中间步骤、无点击，
 `session/qrcode.txt` 存有登录链接备用），**扫码登录成功后该窗口自动关闭**；
 未找到 Edge/Chrome 时降级为默认浏览器打开（需手动关闭）。
-环境变量（均可选）：`DSH_URL`、`WX_BOT_PRESET`（默认 `weixin`）、`WX_BOT_SESSION_DIR`、
-`WX_BOT_CWD`、`WX_BOT_SLOW_ACK_MS`（默认 4000）、`WX_BOT_TURN_TIMEOUT_MS`、
-`WX_BOT_CHUNK_SIZE`、`WX_BOT_POLL_TIMEOUT_MS`（长轮询期望超时，默认 5000）。
+环境变量（均可选，详见下表）：`DSH_URL`、`WX_BOT_PRESET`（默认 `weixin`）、`WX_BOT_SESSION_DIR`、
+`WX_BOT_CWD`、`WX_BOT_SLOW_ACK_MS`、`WX_BOT_TURN_TIMEOUT_MS`、`WX_BOT_CHUNK_SIZE`、
+`WX_BOT_POLL_TIMEOUT_MS`、`WX_BOT_FAST_MODEL`、`WX_BOT_FAST_REASONING`、
+`WX_BOT_COMPLEX_MODEL`、`WX_BOT_COMPLEX_REASONING`、`WX_BOT_COMPLEX_ACK_TEXT`、`WX_BOT_BROWSER`。
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `DSH_URL` | `http://127.0.0.1:3080` | DSH Web 地址 |
+| `WX_BOT_CWD` | 本目录 | 每个微信会话的工作目录（传给 `session.create` 的 cwd） |
+| `WX_BOT_PRESET` | `weixin` | agent preset 名称；缺失时自动降级默认 |
+| `WX_BOT_TURN_TIMEOUT_MS` | `900000`（15 分钟） | 单回合超时，超时自动 `session.cancel` |
+| `WX_BOT_SLOW_ACK_MS` | `4000` | 兜底：简单任务误判超时时回"⏳ 正在处理…" |
+| `WX_BOT_FAST_MODEL` | `deepseek-official/deepseek-v4-flash` | 简单任务模型（秒回，关思考） |
+| `WX_BOT_FAST_REASONING` | `off` | 简单任务思考档位（off/high/max） |
+| `WX_BOT_COMPLEX_MODEL` | `deepseek-official/deepseek-v4-pro` | 复杂任务模型（开思考） |
+| `WX_BOT_COMPLEX_REASONING` | `high` | 复杂任务思考档位 |
+| `WX_BOT_COMPLEX_ACK_TEXT` | `好的，我先思考一下，稍后给你结果…` | 复杂任务先回复的文案 |
+| `WX_BOT_CHUNK_SIZE` | `1800` | 回复分块长度（微信单条消息限制） |
+| `WX_BOT_POLL_TIMEOUT_MS` | `5000` | 长轮询超时基准（服务端 `longpolling_timeout_ms` 优先） |
+| `WX_BOT_BROWSER` | 自动探测 Edge/Chrome | 扫码窗口浏览器路径 |
 
 ## 安装为 DSH 插件
 
@@ -74,12 +91,20 @@ npm run install
   与网页 GUI 的会话互不共享；重启后同一用户自动接续历史会话。
 - **网页端分组**：所有微信会话自动归入「微信会话」workspace，网页左侧分组显示，
   会话内容与网页端完全同步（就是同一个会话）。
-- **慢任务先快速回复**：任务超过 `WX_BOT_SLOW_ACK_MS` 未完成时，先回
-  "⏳ 收到，正在处理…"，完成后发送最终回复。
+- **慢任务先快速回复**：复杂任务（含动作关键词或长文本）先回"好的，我先思考一下"，
+  再切思考模型执行，完成后发最终回复；简单短消息直接快模型秒回（flash + 思考关）。
 - **agent 提问转发微信**：回合中 agent 发起提问时，问题发到微信，直接回复即自动提交答案。
 - **双方对话落盘**：`session/history/<用户>.jsonl` 同时保存微信用户的 query 与 DSH 的回复。
 - **能在对话里干活**：工具能力与 standard preset 一致——Shell、文件、搜索、子代理、工作流
   都能在微信对话里使用，与网页端交流是同一体验。
+
+## 协议对齐（官方）
+
+微信侧协议与官方包 `@tencent-weixin/openclaw-weixin` 逐项对齐：
+请求头 `iLink-App-Id: bot` + `iLink-App-ClientVersion`，请求体 `base_info`，
+发送消息带 `client_id`，上线/下线调用 `notifyStart/notifyStop`。
+登录流程与[官方 clawbot 接口文档](https://developers.weixin.qq.com/doc/aispeech/knowledge/openapi/Clawbotrelated.html)
+一致（qrcode → status 轮询：wait/scaned/confirmed/expired → bot_token）。
 
 ## 已知限制
 

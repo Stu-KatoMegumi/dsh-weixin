@@ -1,11 +1,12 @@
 // src/core/wechat.mjs — ClawBot（微信官方 iLink 通道）客户端
 //
-// 协议依据 @tencent-weixin/openclaw-weixin 的技术解析：
+// 协议依据官方包 @tencent-weixin/openclaw-weixin v2.4.6 源码逐项对齐：
 //   - 登录：GET /ilink/bot/get_bot_qrcode?bot_type=3 返回登录页 URL（liteapp.weixin.qq.com）
-//           → 自动打开浏览器 → 长轮询 get_qrcode_status（每次 hold 约 30s）拿 bot_token
-//   - 收消息：POST /ilink/bot/getupdates（长轮询；get_updates_buf 是游标，必须持久化，
-//             否则重启后重复收旧消息）
-//   - 回消息：POST /ilink/bot/sendmessage，必须原样携带收到的 context_token
+//           → Edge/Chrome --app 独立扫码窗口 → 长轮询 get_qrcode_status 拿 bot_token
+//   - 上线/下线：POST /ilink/bot/msg/notifystart | notifystop（生命周期注册，必做）
+//   - 收消息：POST /ilink/bot/getupdates（长轮询；get_updates_buf 是游标，必须持久化）
+//   - 回消息：POST /ilink/bot/sendmessage，必须带 context_token + client_id
+//   - 所有请求：头 iLink-App-Id: bot + iLink-App-ClientVersion；体 base_info
 // 无第三方依赖，Node >= 22（全局 fetch）。
 
 import fs from 'node:fs'
@@ -14,7 +15,15 @@ import path from 'node:path'
 import { spawn, exec } from 'node:child_process'
 
 const ILINK_DEFAULT = 'https://ilinkai.weixin.qq.com'
+const ILINK_APP_ID = 'bot' // 官方包注册的 appid，服务端据此识别客户端（缺失会导致投递受限）
+const BOT_AGENT = 'weixin-bot'
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+/** iLink-App-ClientVersion：uint32 0x00MMNNPP（major<<16 | minor<<8 | patch） */
+function buildClientVersion(version) {
+  const [major = 0, minor = 0, patch = 0] = String(version).split('.').map((p) => parseInt(p, 10) || 0)
+  return ((major & 0xff) << 16) | ((minor & 0xff) << 8) | (patch & 0xff)
+}
 
 /** 在默认浏览器中打开 URL（Windows 用 cmd start，URL 必须引号包裹防 & 被当命令分隔符） */
 function openBrowser(url) {
@@ -40,14 +49,19 @@ export class WeChatClient {
    * @param {object} opts
    * @param {string} opts.stateFile 状态文件（bot.json：token/baseUrl/updatesBuf）
    * @param {number} [opts.chunkSize] 发送分块长度，默认 1800
-   * @param {number} [opts.pollTimeoutMs] 请求 getupdates 时希望的长轮询超时（毫秒），默认 5000
+   * @param {number} [opts.pollTimeoutMs] 长轮询超时（毫秒），默认 5000；服务端返回的
+   *                                      longpolling_timeout_ms 优先
+   * @param {string} [opts.version] 客户端版本号（生成 iLink-App-ClientVersion），默认 1.0.0
    * @param {(line: string) => void} [opts.log] 日志输出，默认 console
    */
-  constructor({ stateFile, chunkSize = 1800, pollTimeoutMs = 5000, log = console.log }) {
+  constructor({ stateFile, chunkSize = 1800, pollTimeoutMs = 5000, version = '1.0.0', log = console.log }) {
     this.stateFile = stateFile
     this.chunkSize = chunkSize
     this.pollTimeoutMs = pollTimeoutMs
     this.log = log
+    this.version = version
+    this.clientVersion = buildClientVersion(version)
+    this.nextPollTimeoutMs = pollTimeoutMs
     this.state = this.#loadState()
     this.token = this.state.botToken
     this.baseUrl = this.state.baseUrl || ILINK_DEFAULT
@@ -83,15 +97,36 @@ export class WeChatClient {
       'content-type': 'application/json',
       'authorizationtype': 'ilink_bot_token',
       'x-wechat-uin': this.#randomUin(),
+      // 官方协议要求：服务端据此识别客户端（缺失会导致投递受限/被限流）
+      'iLink-App-Id': ILINK_APP_ID,
+      'iLink-App-ClientVersion': String(this.clientVersion),
     }
     if (this.token) headers.authorization = `Bearer ${this.token}`
     const res = await fetch(this.baseUrl + pathname, {
       method: 'POST',
       headers,
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(Math.max(this.pollTimeoutMs + 15_000, 70_000)),
+      body: JSON.stringify({ ...body, base_info: { channel_version: this.version, bot_agent: BOT_AGENT } }),
+      signal: AbortSignal.timeout(Math.max(this.nextPollTimeoutMs + 15_000, 70_000)),
     })
     return res.json().catch(() => ({ ret: -1, message: `HTTP ${res.status}` }))
+  }
+
+  /** 通知微信侧客户端上线（生命周期注册，官方协议步骤） */
+  async notifyStart() {
+    const r = await this.#ilink('/ilink/bot/msg/notifystart', {})
+    if (typeof r.ret === 'number' && r.ret !== 0) {
+      console.warn(`[wechat] notifyStart 返回: ${JSON.stringify(r)}`)
+    } else {
+      this.log('[wechat] 已通知微信侧客户端上线')
+    }
+    return r
+  }
+
+  /** 通知微信侧客户端下线（退出时调用） */
+  async notifyStop() {
+    try {
+      await this.#ilink('/ilink/bot/msg/notifystop', {})
+    } catch { /* 退出路径不阻塞 */ }
   }
 
   // ── 登录 ──
@@ -145,7 +180,12 @@ export class WeChatClient {
           this.#closeScan()
           throw new Error('二维码已失效，请重新运行')
         }
-        this.log(`[wechat] 等待扫码确认（${new Date().toLocaleTimeString()}）…`)
+        // 官方文档状态：wait（等待扫描）/ scaned（已扫描）/ confirmed（已确认）/ expired（已过期）
+        if (st.status === 'scaned') {
+          this.log('[wechat] 已扫码，等待确认…')
+        } else {
+          this.log(`[wechat] 等待扫码确认（${new Date().toLocaleTimeString()}）…`)
+        }
       } catch (error) {
         if (error.message === '二维码已失效，请重新运行') throw error
         console.warn(`[wechat] 轮询扫码状态出错，3 秒后重试: ${error.message}`)
@@ -171,12 +211,13 @@ export class WeChatClient {
     const buf = this.state.updatesBuf ?? ''
     const r = await this.#ilink('/ilink/bot/getupdates', {
       get_updates_buf: buf,
-      base_info: { channel_version: '1.0.2' },
-      // 尝试缩短服务端 hold（若服务端支持；不支持则忽略，保持原 35s 行为）
-      longpolling_timeout_ms: this.pollTimeoutMs,
     })
     // 成功响应没有 ret 字段（{"msgs":[...],"get_updates_buf":...}），只有失败才带 ret != 0
     if (typeof r.ret === 'number' && r.ret !== 0) throw new Error(JSON.stringify(r))
+    // 服务端建议的下次长轮询超时优先
+    if (typeof r.longpolling_timeout_ms === 'number' && r.longpolling_timeout_ms > 0) {
+      this.nextPollTimeoutMs = r.longpolling_timeout_ms
+    }
     if (r.get_updates_buf) {
       this.state.updatesBuf = r.get_updates_buf
       this.#saveState()
@@ -190,6 +231,11 @@ export class WeChatClient {
    * @param {(msg: object) => void | Promise<void>} handler
    */
   async startPolling(handler) {
+    // 上线通知（生命周期注册；每次进程启动都要做）
+    if (!this.notified) {
+      this.notified = true
+      try { await this.notifyStart() } catch { /* 不阻塞轮询 */ }
+    }
     for (;;) {
       if (this.stopped) return
       try {
@@ -209,26 +255,33 @@ export class WeChatClient {
 
   // ── 发消息 ──
 
-  /** 发送文本（分块；context_token 必须原样带回） */
+  /** 发送文本（分块；context_token 必须原样带回，client_id 为每次发送的唯一标识） */
   async sendText(fromUserId, contextToken, text) {
     for (let i = 0; i < text.length; i += this.chunkSize) {
       const part = text.slice(i, i + this.chunkSize)
       const r = await this.#ilink('/ilink/bot/sendmessage', {
         msg: {
+          from_user_id: '',
           to_user_id: fromUserId,
+          client_id: `weixin-bot-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`,
           message_type: 2, // BOT 发出
           message_state: 2, // FINISH（完整消息）
           context_token: contextToken,
           item_list: [{ type: 1, text_item: { text: part } }],
         },
       })
-      if (typeof r.ret === 'number' && r.ret !== 0) console.warn('[wechat] 发送失败:', JSON.stringify(r))
+      // 每次发送都记录服务端响应，便于排查投递问题
+      const failed = typeof r.ret === 'number' && r.ret !== 0
+      console.log(
+        `[wechat] 发送${failed ? '失败' : '成功'}（${part.length}字）: ${failed ? JSON.stringify(r) : 'ret=' + (r.ret ?? 0)}`,
+      )
     }
   }
 
   stop() {
     this.stopped = true
     this.#closeScan()
+    void this.notifyStop()
   }
 }
 

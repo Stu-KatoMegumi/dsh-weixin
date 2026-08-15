@@ -1,10 +1,32 @@
 // src/core/engine.mjs — 核心编排（两种模式共享）
 //
-// 流程：微信消息 → 保证会话存在（含「微信会话」分组）→ 存入本地历史 →
-//       发送给 DSH 解答 → 回复存入本地历史 → 转发回微信显示。
-// 附带：agent 提问转发微信并自动应答、慢任务先回"正在处理"、长回复分块。
+// 流程：微信消息 → 复杂度判断 →（复杂：先回"好的，我先思考一下"+ 切思考模型）
+//       → 保证会话存在（含「微信会话」分组）→ 存入本地历史 → 发送给 DSH 解答 →
+//       回复存入本地历史 → 转发回微信显示。
+// 附带：agent 提问转发微信并自动应答、慢任务兜底"正在处理"、长回复分块。
 
 import { formatQuestions } from './wechat.mjs'
+
+/** 复杂任务关键词（命中即判定为长任务，先思考确认再执行） */
+const ACTION_RE = /(写|改|创建|生成|删除|移动|复制|运行|执行|启动|停止|安装|下载|上传|搜索|查询|查找|分析|总结|整理|重构|调试|测试|构建|打包|部署|提交|推送|合并|克隆|备份|翻译|转换|压缩|解压|读取|查看|打开|列出|统计|计算|规划|设计|开发|实现|排查|修复|对比|监控|定时|任务|项目|文件|代码|脚本|命令|目录|文件夹|网页|接口|docker|git|npm|pnpm|node|python|pip|ssh|数据库|mysql|redis|sql|api)/i
+
+/** 从环境变量解析模型路由配置（默认：简单→flash 关思考，复杂→pro 高思考） */
+export function modelConfig(env = process.env) {
+  const spec = (model, reasoning) => {
+    if (!model) return null
+    const slash = model.indexOf('/')
+    return {
+      provider: slash > 0 ? model.slice(0, slash) : 'deepseek-official',
+      model: slash > 0 ? model.slice(slash + 1) : model,
+      reasoningEffort: reasoning ? String(reasoning).toLowerCase() : undefined, // 目录里 effort id 是小写
+    }
+  }
+  return {
+    fastModel: spec(env.WX_BOT_FAST_MODEL || 'deepseek-official/deepseek-v4-flash', env.WX_BOT_FAST_REASONING || 'off'),
+    complexModel: spec(env.WX_BOT_COMPLEX_MODEL || 'deepseek-official/deepseek-v4-pro', env.WX_BOT_COMPLEX_REASONING || 'high'),
+    complexAckText: env.WX_BOT_COMPLEX_ACK_TEXT || '好的，我先思考一下，稍后给你结果…',
+  }
+}
 
 export class Engine {
   /**
@@ -12,7 +34,7 @@ export class Engine {
    * @param {import('./wechat.mjs').WeChatClient} deps.wechat
    * @param {import('./store.mjs').Store} deps.store
    * @param {import('../dsh/transport.mjs').BaseTransport} deps.transport
-   * @param {object} deps.config { slowAckMs, turnTimeoutMs }
+   * @param {object} deps.config { slowAckMs, turnTimeoutMs, fastModel, complexModel, complexAckText }
    */
   constructor({ wechat, store, transport, config }) {
     this.wechat = wechat
@@ -20,6 +42,9 @@ export class Engine {
     this.transport = transport
     this.slowAckMs = config.slowAckMs ?? 4000
     this.turnTimeoutMs = config.turnTimeoutMs ?? 15 * 60 * 1000
+    this.fastModel = config.fastModel ?? null
+    this.complexModel = config.complexModel ?? null
+    this.complexAckText = config.complexAckText ?? '好的，我先思考一下，稍后给你结果…'
     this.userBySession = new Map() // sessionId -> { from, token }
     this.started = false
   }
@@ -88,16 +113,51 @@ export class Engine {
     this.store.appendHistory(userKey, 'user', text)
     console.log(`[engine] ${userKey}: ${text.slice(0, 80)}  -> 会话 ${sessionId}`)
     try {
+      // 复杂度判断：复杂任务先回"好的，我先思考一下"并切思考模型；简单任务切快模型秒回
+      const complex = this.#isComplex(text)
+      let model = null
+      let slowMs = this.slowAckMs
+      if (complex) {
+        await this.wechat.sendText(userKey, msg.context_token, this.complexAckText)
+        model = await this.#selectModel(sessionId, this.complexModel)
+        slowMs = 0 // 已有"思考中"文案，关闭 4 秒兜底提示
+      } else {
+        model = await this.#selectModel(sessionId, this.fastModel)
+      }
       const reply = await this.transport.ask(sessionId, text, {
         timeoutMs: this.turnTimeoutMs,
-        slowMs: this.slowAckMs,
+        slowMs,
       })
       const out = reply || '（DSH 没有返回内容）'
       this.store.appendHistory(userKey, 'assistant', out)
       await this.wechat.sendText(userKey, msg.context_token, out)
+      console.log(
+        `[engine] 回合完成（${complex ? '复杂' : '简单'}` +
+        (model ? `，模型=${model.model}/${model.reasoningEffort || '默认'}` : '') + '）',
+      )
     } catch (error) {
       console.error('[engine] 回合失败:', error.message)
       await this.wechat.sendText(userKey, msg.context_token, `出错：${error.message}`)
+    }
+  }
+
+  // ── 内部：复杂度判断与模型路由 ──
+
+  /** 短文本且无动作关键词 = 简单任务（秒回）；否则视为复杂任务（先思考） */
+  #isComplex(text) {
+    if (text.length > 40) return true
+    return ACTION_RE.test(text)
+  }
+
+  /** 切换会话模型；失败不阻塞（沿用会话当前模型） */
+  async #selectModel(sessionId, spec) {
+    if (!spec || typeof this.transport.selectModel !== 'function') return null
+    try {
+      await this.transport.selectModel(sessionId, spec)
+      return spec
+    } catch (error) {
+      console.warn(`[engine] 模型切换失败（${spec.provider}/${spec.model}）: ${error.message}`)
+      return null
     }
   }
 

@@ -12,11 +12,22 @@
 //   slowAckMs / turnTimeoutMs / chunkSize / pollTimeoutMs 见 README
 
 import path from 'node:path'
+import fs from 'node:fs'
+import { fileURLToPath } from 'node:url'
 import z from '@deepseek-ai/schemastery'
+import { installTimestampLogging } from '../core/log.mjs'
 import { WeChatClient } from '../core/wechat.mjs'
 import { Store } from '../core/store.mjs'
-import { Engine } from '../core/engine.mjs'
+import { Engine, modelConfig } from '../core/engine.mjs'
 import { InprocTransport } from '../dsh/inproc.mjs'
+
+installTimestampLogging() // 所有日志带时间戳
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
+let PLUGIN_VERSION = '1.0.0'
+try {
+  PLUGIN_VERSION = JSON.parse(fs.readFileSync(path.join(__dirname, '..', '..', 'version.json'), 'utf8')).version
+} catch { /* 保持默认 */ }
 
 export const name = 'weixin-bot'
 export const inject = ['apiProxy']
@@ -44,6 +55,7 @@ export function apply(ctx, config = {}) {
     turnTimeoutMs: config.turnTimeoutMs ?? Number(process.env.WX_BOT_TURN_TIMEOUT_MS || 15 * 60 * 1000),
     chunkSize: config.chunkSize ?? Number(process.env.WX_BOT_CHUNK_SIZE || 1800),
     pollTimeoutMs: config.pollTimeoutMs ?? Number(process.env.WX_BOT_POLL_TIMEOUT_MS || 5000),
+    ...modelConfig(), // 模型路由：简单→flash关思考 / 复杂→pro高思考（可环境变量覆盖）
   }
 
   console.log(`[weixin-bot] 插件启动: preset=${preset} sessionDir=${sessionDir} 分组=${workspaceTitle}`)
@@ -52,6 +64,7 @@ export function apply(ctx, config = {}) {
     stateFile: path.join(sessionDir, 'bot.json'),
     chunkSize: engineConfig.chunkSize,
     pollTimeoutMs: engineConfig.pollTimeoutMs,
+    version: PLUGIN_VERSION,
   })
   const store = new Store(sessionDir)
   const transport = new InprocTransport(ctx.apiProxy, { preset, sessionCwd, workspaceTitle })
