@@ -1,18 +1,6 @@
-// src/plugin/index.mjs — DSH 插件入口（host 平面）
-//
-// 安装后由 $DSH_HOME/cordis.patch.yml 的 dsh-weixin 行挂载，随 `pnpm dsh web`
-// 一起加载。与独立模式共用同一套核心，只是 DSH 传输层换成进程内 apiProxy
-// （不经 HTTP/WebSocket，事件直接消费 apiProxy.events.mux() 的异步迭代器）。
-//
-// 插件配置（cordis.patch.yml 里 dsh-weixin 行的 config）：
-//   sessionDir     本地 session 目录（建议指向项目文件夹，双方对话落盘处）
-//   sessionCwd     微信会话的工作目录（也是「微信会话」分组的目录）
-//   workspaceTitle 分组显示名，默认「微信会话」
-//   preset         agent preset，默认 weixin
-//   slowAckMs / turnTimeoutMs / chunkSize / pollTimeoutMs 见 README
-
-import path from 'node:path'
 import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import z from '@deepseek-ai/schemastery'
 import { installTimestampLogging } from '../core/log.mjs'
@@ -20,59 +8,91 @@ import { WeChatClient } from '../core/wechat.mjs'
 import { Store } from '../core/store.mjs'
 import { Engine, modelConfig } from '../core/engine.mjs'
 import { InprocTransport } from '../dsh/inproc.mjs'
+import { registerControlApi } from './control.mjs'
 
-installTimestampLogging() // 所有日志带时间戳
+installTimestampLogging()
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url))
-let PLUGIN_VERSION = '1.0.0'
-try {
-  PLUGIN_VERSION = JSON.parse(fs.readFileSync(path.join(__dirname, '..', '..', 'version.json'), 'utf8')).version
-} catch { /* 保持默认 */ }
+const dirname = path.dirname(fileURLToPath(import.meta.url))
+const projectDir = path.resolve(dirname, '../..')
+let pluginVersion = '1.0.1'
+try { pluginVersion = JSON.parse(fs.readFileSync(path.join(projectDir, 'version.json'), 'utf8')).version } catch { /* default */ }
 
 export const name = 'dsh-weixin'
-export const inject = ['apiProxy']
+export const inject = ['apiProxy', 'webServer']
+
+const jobSchema = z.object({
+  id: z.string().default(''),
+  cron: z.string().default('0 9 * * *'),
+  userId: z.string().default(''),
+  prompt: z.string().default(''),
+  enabled: z.boolean().default(true),
+})
 
 export const Config = z.object({
+  enabled: z.boolean().default(true),
   sessionDir: z.string().default(''),
   sessionCwd: z.string().default(''),
   workspaceTitle: z.string().default('微信会话'),
-  preset: z.string().default('weixin'),
+  preset: z.string().default('standard'),
+  accessPolicy: z.union(['pairing', 'allowlist', 'disabled']).default('pairing'),
+  allowlist: z.array(z.string()).default([]),
+  admins: z.array(z.string()).default([]),
+  streaming: z.boolean().default(true),
+  typing: z.boolean().default(true),
+  mediaEnabled: z.boolean().default(true),
+  renewalEnabled: z.boolean().default(true),
   slowAckMs: z.number().default(4000),
   turnTimeoutMs: z.number().default(15 * 60 * 1000),
+  streamFlushChars: z.number().default(240),
+  streamFlushMs: z.number().default(900),
   chunkSize: z.number().default(1800),
   pollTimeoutMs: z.number().default(5000),
+  watchdogMs: z.number().default(90_000),
+  renewAfterMs: z.number().default(24 * 60 * 60 * 1000),
+  renewWarnBeforeMs: z.number().default(2 * 60 * 60 * 1000),
+  outboxDir: z.string().default(''),
+  jobs: z.array(jobSchema).default([]),
 })
 
 export function apply(ctx, config = {}) {
-  const preset = config.preset || process.env.WX_BOT_PRESET || 'weixin'
-  const projectDir = path.resolve(__dirname, '../..')
-  const sessionCwd = path.resolve(config.sessionCwd || process.env.WX_BOT_CWD || projectDir)
+  const dshHome = process.env.DSH_HOME || path.join(os.homedir(), '.dsh')
+  const sessionCwd = path.resolve(config.sessionCwd || process.env.WX_BOT_CWD || process.cwd())
   const sessionDir = path.resolve(
-    config.sessionDir || process.env.WX_BOT_SESSION_DIR || path.join(sessionCwd, 'session'),
+    config.sessionDir || process.env.WX_BOT_SESSION_DIR || path.join(dshHome, 'channels', 'dsh-weixin'),
   )
-  const workspaceTitle = config.workspaceTitle || '微信会话'
+  const preset = config.preset || process.env.WX_BOT_PRESET || 'standard'
   const engineConfig = {
+    ...config,
+    sessionCwd,
+    outboxDir: path.resolve(config.outboxDir || path.join(sessionCwd, 'outbox')),
     slowAckMs: config.slowAckMs ?? Number(process.env.WX_BOT_SLOW_ACK_MS || 4000),
     turnTimeoutMs: config.turnTimeoutMs ?? Number(process.env.WX_BOT_TURN_TIMEOUT_MS || 15 * 60 * 1000),
-    chunkSize: config.chunkSize ?? Number(process.env.WX_BOT_CHUNK_SIZE || 1800),
-    pollTimeoutMs: config.pollTimeoutMs ?? Number(process.env.WX_BOT_POLL_TIMEOUT_MS || 5000),
-    ...modelConfig(), // 模型路由：简单→flash关思考 / 复杂→pro高思考（可环境变量覆盖）
+    ...modelConfig(),
   }
-
-  console.log(`[dsh-weixin] 插件启动: preset=${preset} sessionDir=${sessionDir} 分组=${workspaceTitle}`)
-
-  const wechat = new WeChatClient({
-    stateFile: path.join(sessionDir, 'bot.json'),
-    chunkSize: engineConfig.chunkSize,
-    pollTimeoutMs: engineConfig.pollTimeoutMs,
-    version: PLUGIN_VERSION,
-  })
   const store = new Store(sessionDir)
-  const transport = new InprocTransport(ctx.apiProxy, { preset, sessionCwd, workspaceTitle })
+  const wechat = new WeChatClient({
+    stateFile: store.botFile,
+    mediaDir: path.join(sessionDir, 'media'),
+    chunkSize: config.chunkSize ?? 1800,
+    pollTimeoutMs: config.pollTimeoutMs ?? 5000,
+    watchdogMs: config.watchdogMs ?? 90_000,
+    renewAfterMs: config.renewAfterMs ?? 24 * 60 * 60 * 1000,
+    renewWarnBeforeMs: config.renewWarnBeforeMs ?? 2 * 60 * 60 * 1000,
+    version: pluginVersion,
+  })
+  const transport = new InprocTransport(ctx.apiProxy, {
+    preset,
+    sessionCwd,
+    workspaceTitle: config.workspaceTitle || '微信会话',
+    timeoutMs: engineConfig.turnTimeoutMs,
+    slowMs: engineConfig.slowAckMs,
+  })
   const engine = new Engine({ wechat, store, transport, config: engineConfig })
 
+  console.log(`[dsh-weixin] v${pluginVersion} 加载：sessionDir=${sessionDir} preset=${preset}`)
   ctx.effect(() => {
     engine.start()
     return () => engine.stop()
-  })
+  }, 'dsh-weixin: runtime')
+  ctx.effect(() => registerControlApi(ctx.webServer, engine, wechat), 'dsh-weixin: settings api')
 }

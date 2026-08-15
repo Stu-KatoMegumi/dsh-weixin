@@ -1,12 +1,5 @@
-// src/standalone/main.mjs — 独立模式入口（npm start）
-//
-// 与插件模式共用同一套核心（wechat / store / engine），只是 DSH 传输层用
-// HTTP RPC + WebSocket（ws 不可用时自动降级 session.history 轮询）。
-//
-// 配置：环境变量（DSH_URL / WX_BOT_*），见 README。
-
-import path from 'node:path'
 import fs from 'node:fs'
+import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { installTimestampLogging } from '../core/log.mjs'
 import { WeChatClient } from '../core/wechat.mjs'
@@ -14,58 +7,82 @@ import { Store } from '../core/store.mjs'
 import { Engine, modelConfig } from '../core/engine.mjs'
 import { HttpTransport } from '../dsh/http.mjs'
 
-installTimestampLogging() // 所有日志带时间戳
+installTimestampLogging()
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const projectDir = path.resolve(__dirname, '../..')
-const sessionDir = path.resolve(process.env.WX_BOT_SESSION_DIR || path.join(projectDir, 'session'))
-let version = '1.0.0'
-try { version = JSON.parse(fs.readFileSync(path.join(projectDir, 'version.json'), 'utf8')).version } catch { /* 保持默认 */ }
+const dirname = path.dirname(fileURLToPath(import.meta.url))
+const projectDir = path.resolve(dirname, '../..')
+const sessionCwd = path.resolve(process.env.WX_BOT_CWD || projectDir)
+const sessionDir = path.resolve(process.env.WX_BOT_SESSION_DIR || path.join(sessionCwd, 'session'))
+const list = value => String(value || '').split(/[\s,;]+/).filter(Boolean)
+const flag = (value, fallback = true) => value == null ? fallback : !['0', 'false', 'off'].includes(String(value).toLowerCase())
+let version = '1.0.1'
+try { version = JSON.parse(fs.readFileSync(path.join(projectDir, 'version.json'), 'utf8')).version } catch { /* default */ }
 
 const config = {
   dshBase: process.env.DSH_URL || 'http://127.0.0.1:3080',
-  preset: process.env.WX_BOT_PRESET || 'weixin',
-  sessionCwd: process.env.WX_BOT_CWD || projectDir,
-  workspaceTitle: '微信会话',
+  preset: process.env.WX_BOT_PRESET || 'standard',
+  sessionCwd,
+  workspaceTitle: process.env.WX_BOT_WORKSPACE_TITLE || '微信会话',
+  enabled: flag(process.env.WX_BOT_ENABLED),
+  streaming: flag(process.env.WX_BOT_STREAMING),
+  typing: flag(process.env.WX_BOT_TYPING),
+  mediaEnabled: flag(process.env.WX_BOT_MEDIA),
+  renewalEnabled: flag(process.env.WX_BOT_RENEWAL),
+  accessPolicy: process.env.WX_BOT_ACCESS_POLICY || 'pairing',
+  allowlist: list(process.env.WX_BOT_ALLOWLIST),
+  admins: list(process.env.WX_BOT_ADMINS),
   slowAckMs: Number(process.env.WX_BOT_SLOW_ACK_MS || 4000),
   turnTimeoutMs: Number(process.env.WX_BOT_TURN_TIMEOUT_MS || 15 * 60 * 1000),
-  chunkSize: Number(process.env.WX_BOT_CHUNK_SIZE || 1800),
-  pollTimeoutMs: Number(process.env.WX_BOT_POLL_TIMEOUT_MS || 5000),
-  ...modelConfig(), // 模型路由：简单→flash关思考 / 复杂→pro高思考（可环境变量覆盖）
+  streamFlushChars: Number(process.env.WX_BOT_STREAM_FLUSH_CHARS || 240),
+  streamFlushMs: Number(process.env.WX_BOT_STREAM_FLUSH_MS || 900),
+  outboxDir: path.resolve(process.env.WX_BOT_OUTBOX_DIR || path.join(sessionCwd, 'outbox')),
+  ...modelConfig(),
 }
 
-const store = new Store(sessionDir)
-const wechat = new WeChatClient({
-  stateFile: path.join(sessionDir, 'bot.json'),
-  chunkSize: config.chunkSize,
-  pollTimeoutMs: config.pollTimeoutMs,
-  version,
-})
 const transport = new HttpTransport({
   base: config.dshBase,
   preset: config.preset,
-  sessionCwd: config.sessionCwd,
+  sessionCwd,
   workspaceTitle: config.workspaceTitle,
-})
-const engine = new Engine({ wechat, store, transport, config })
-
-console.log('┌──────────────────────────────────────────────────────┐')
-console.log('│  dsh-weixin（独立模式）                                │')
-console.log('│  DSH:      ' + config.dshBase.padEnd(39) + '│')
-console.log('│  preset:   ' + config.preset.padEnd(39) + '│')
-console.log('│  session:  ' + sessionDir.padEnd(39) + '│')
-console.log('│  会话分组：' + config.workspaceTitle.padEnd(39) + '│')
-console.log('└──────────────────────────────────────────────────────┘')
-
-engine.start()
-
-process.on('SIGINT', () => {
-  console.log('\n[main] 退出…')
-  engine.stop()
-  process.exit(0)
+  timeoutMs: config.turnTimeoutMs,
+  slowMs: config.slowAckMs,
 })
 
-// 顶层错误兜底（登录失败等）
-process.on('unhandledRejection', (error) => {
-  console.error('[main] 未处理的拒绝:', error?.message ?? error)
-})
+let dshReady = false
+try {
+  await transport.probe({ timeoutMs: Number(process.env.DSH_STARTUP_CHECK_TIMEOUT_MS || 3000) })
+  dshReady = true
+} catch (error) {
+  console.error(`[dsh-weixin] 未检测到可用的 DSH 服务：${config.dshBase}`)
+  console.error('[dsh-weixin] 请先启动 DSH（在 DSH 目录执行：pnpm dsh web），然后再运行 npm start。')
+  console.error(`[dsh-weixin] 检测失败：${error?.message ?? error}`)
+  process.exitCode = 1
+}
+
+if (dshReady) {
+  const store = new Store(sessionDir)
+  const wechat = new WeChatClient({
+    stateFile: store.botFile,
+    mediaDir: path.join(sessionDir, 'media'),
+    chunkSize: Number(process.env.WX_BOT_CHUNK_SIZE || 1800),
+    pollTimeoutMs: Number(process.env.WX_BOT_POLL_TIMEOUT_MS || 5000),
+    watchdogMs: Number(process.env.WX_BOT_WATCHDOG_MS || 90_000),
+    version,
+  })
+  const engine = new Engine({ wechat, store, transport, config })
+
+  console.log(`[dsh-weixin] v${version} 独立模式`)
+  console.log(`[dsh-weixin] DSH=${config.dshBase} sessionDir=${sessionDir}`)
+  engine.start()
+
+  const shutdown = () => {
+    console.log('[dsh-weixin] 正在停止…')
+    engine.stop()
+  }
+  process.once('SIGINT', () => { shutdown(); process.exit(0) })
+  process.once('SIGTERM', () => { shutdown(); process.exit(0) })
+  process.on('unhandledRejection', error => {
+    store.appendError('unhandledRejection', error)
+    console.error('[dsh-weixin] 未处理异常:', error?.message ?? error)
+  })
+}

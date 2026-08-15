@@ -1,27 +1,20 @@
-// Shared transport for the DSH in-process and HTTP adapters.
-//
-// DSH exposes one logical event contract over two physical transports.  This
-// class deliberately knows only that a transport can send prompts/cancels and
-// deliver MuxFrame objects; the API-specific code lives in inproc.mjs/http.mjs.
-
 import crypto from 'node:crypto'
 
 const DEFAULT_TIMEOUT = 15 * 60 * 1000
-const DEFAULT_SLOW = 4 * 1000
+const DEFAULT_SLOW = 4000
 
 function newRpcId(prefix = 'dsh-weixin') {
   return `${prefix}-${crypto.randomUUID()}`
 }
 
 function rpcError(result, fallback = 'DSH RPC failed') {
-  const error = result?.error ?? result
-  const message = typeof error === 'string' ? error : error?.message || fallback
-  const out = new Error(message)
-  if (error && typeof error === 'object') {
-    out.code = error.code
-    out.details = error.details
+  const value = result?.error ?? result
+  const error = new Error(typeof value === 'string' ? value : value?.message || fallback)
+  if (value && typeof value === 'object') {
+    error.code = value.code
+    error.details = value.details
   }
-  return out
+  return error
 }
 
 function unwrapResult(response) {
@@ -34,15 +27,9 @@ function textFromValue(value) {
   if (typeof value === 'string') return value
   if (!value || typeof value !== 'object') return ''
   if (typeof value.text === 'string') return value.text
-  if (typeof value.content === 'string') return value.content
-  if (Array.isArray(value.content)) {
-    return value.content.map((part) => textFromValue(part)).filter(Boolean).join('')
-  }
-  if (Array.isArray(value.parts)) {
-    return value.parts.map((part) => textFromValue(part)).filter(Boolean).join('')
-  }
-  if (value.message) return textFromValue(value.message)
-  return ''
+  if (Array.isArray(value.content)) return value.content.map(textFromValue).filter(Boolean).join('')
+  if (Array.isArray(value.parts)) return value.parts.map(textFromValue).filter(Boolean).join('')
+  return value.message ? textFromValue(value.message) : ''
 }
 
 function eventText(event) {
@@ -50,15 +37,11 @@ function eventText(event) {
   return textFromValue(data?.message ?? data?.content ?? data?.text ?? data)
 }
 
-function eventKind(event) {
-  return event?.type || event?.kind || event?.event || ''
-}
-
 function eventTurn(event) {
-  const data = event?.data
-  return data?.turn ?? event?.turn ?? data?.turnId ?? event?.turnId ?? null
+  return event?.data?.turn ?? event?.turn ?? event?.data?.turnId ?? event?.turnId ?? null
 }
 
+/** Shared event/turn coordinator used by the in-process and HTTP adapters. */
 export class BaseTransport {
   constructor({ timeoutMs = DEFAULT_TIMEOUT, slowMs = DEFAULT_SLOW } = {}) {
     this.timeoutMs = timeoutMs
@@ -68,6 +51,7 @@ export class BaseTransport {
     this.turns = new Map()
     this.waiters = new Map()
     this.questions = new Map()
+    this.sessionChains = new Map()
     this.onQuestion = () => {}
     this.onSlow = () => {}
     this.onStall = () => {}
@@ -76,9 +60,7 @@ export class BaseTransport {
   start() {
     if (this.started) return
     this.started = true
-    try {
-      this._startStream?.()
-    } catch (error) {
+    try { this._startStream?.() } catch (error) {
       this.started = false
       throw error
     }
@@ -94,26 +76,46 @@ export class BaseTransport {
     this.waiters.clear()
     this.questions.clear()
     this.turns.clear()
+    this.sessionChains.clear()
     this._stopStream?.()
   }
 
   pendingQuestion(sessionId) {
-    for (const question of this.questions.values()) {
-      if (question.sessionId === sessionId) return question
-    }
-    return null
+    return [...this.questions.values()].find(question => question.sessionId === sessionId) ?? null
   }
 
-  async ensureSession(userKey) {
-    return this._ensureSession(String(userKey))
+  async ensureSession(userKey, options = {}) {
+    return this._ensureSession(String(userKey), options)
   }
 
   async selectModel(sessionId, model) {
-    if (!model) return null
-    return this._selectModel(sessionId, model)
+    return model ? this._selectModel(sessionId, model) : null
   }
 
-  async ask(sessionId, text, { timeoutMs = this.timeoutMs, slowMs = this.slowMs } = {}) {
+  async cancel(sessionId) {
+    return this._cancel(sessionId)
+  }
+
+  async status(sessionId) {
+    return this._status?.(sessionId) ?? { sessionId }
+  }
+
+  /** Serialize prompts per session so chunks cannot cross between two turns. */
+  ask(sessionId, text, options = {}) {
+    const prior = this.sessionChains.get(sessionId) ?? Promise.resolve()
+    const current = prior.catch(() => {}).then(() => this.#askOne(sessionId, text, options))
+    this.sessionChains.set(sessionId, current)
+    void current.finally(() => {
+      if (this.sessionChains.get(sessionId) === current) this.sessionChains.delete(sessionId)
+    }).catch(() => {})
+    return current
+  }
+
+  async #askOne(sessionId, text, {
+    timeoutMs = this.timeoutMs,
+    slowMs = this.slowMs,
+    onDelta = null,
+  } = {}) {
     if (!this.started) this.start()
     const baseline = this.lastSeq.get(sessionId) ?? 0
     const key = `${sessionId}:${newRpcId('turn')}`
@@ -123,6 +125,7 @@ export class BaseTransport {
         baseline,
         resolve,
         reject,
+        onDelta: typeof onDelta === 'function' ? onDelta : null,
         slowTimer: null,
         timeout: null,
       }
@@ -158,16 +161,12 @@ export class BaseTransport {
 
   async answerQuestion(rpcId, sessionId, text) {
     const question = this.questions.get(rpcId)
-    if (!question || question.sessionId !== sessionId) {
-      throw new Error('该提问已过期或不属于当前会话')
-    }
+    if (!question || question.sessionId !== sessionId) throw new Error('该提问已过期或不属于当前会话')
     await this._respondQuestion(rpcId, sessionId, question.questions, text)
     this.questions.delete(rpcId)
   }
 
   _handleEnvelope(envelope) {
-    // apiProxy.events.mux() yields RpcRequest<Frame>; HTTP/WebSocket yields a
-    // server-request envelope.  Both have the same rpcId/payload shape here.
     const frame = envelope?.payload ?? envelope
     if (!frame || typeof frame !== 'object') return
     if (frame.type === 'question/requested') {
@@ -186,11 +185,10 @@ export class BaseTransport {
       return
     }
     if (frame.type === 'stream/error') {
-      this.onStall(frame.error?.message || 'DSH 事件流发生错误')
+      this.onStall(frame.error?.message || 'DSH event stream failed')
       return
     }
     if (frame.type !== 'session/event' || !frame.event) return
-
     const sessionId = frame.sessionId
     const seq = Number(frame.event.seq ?? frame.event.sequence ?? 0)
     if (seq) this.lastSeq.set(sessionId, Math.max(seq, this.lastSeq.get(sessionId) ?? 0))
@@ -198,7 +196,7 @@ export class BaseTransport {
   }
 
   _handleSessionEvent(sessionId, event) {
-    const kind = eventKind(event)
+    const kind = event?.type || event?.kind || event?.event || ''
     const turn = eventTurn(event)
     let state = this.turns.get(sessionId)
     if (!state || (turn != null && state.turn != null && String(state.turn) !== String(turn))) {
@@ -210,8 +208,17 @@ export class BaseTransport {
 
     if (kind === 'assistant/chunk' || kind === 'assistant/delta' || kind === 'message/chunk') {
       const chunk = event?.data?.chunk ?? event?.chunk ?? event?.data
-      if (chunk?.type === 'text-delta' && typeof chunk.text === 'string') state.text += chunk.text
-      else if (typeof chunk?.text === 'string') state.text += chunk.text
+      const delta = typeof chunk?.text === 'string' ? chunk.text : ''
+      if (delta && (!chunk?.type || chunk.type === 'text-delta')) {
+        state.text += delta
+        for (const waiter of this.waiters.values()) {
+          if (waiter.sessionId === sessionId && Number(event.seq ?? 0) > waiter.baseline) {
+            try { waiter.onDelta?.(delta, state.text) } catch (error) {
+              console.warn('[dsh-weixin] stream consumer failed:', error?.message ?? error)
+            }
+          }
+        }
+      }
       return
     }
     if (kind === 'assistant/message' || kind === 'message/assistant') {
@@ -221,22 +228,22 @@ export class BaseTransport {
     }
     if (kind !== 'turn/end' && kind !== 'turn/ended') return
 
-    const waiterEntries = [...this.waiters.entries()].filter(([, waiter]) => (
-      waiter.sessionId === sessionId && (Number(event.seq ?? 0) === 0 || Number(event.seq) > waiter.baseline)
+    const seq = Number(event.seq ?? 0)
+    const entries = [...this.waiters.entries()].filter(([, waiter]) => (
+      waiter.sessionId === sessionId && (seq === 0 || seq > waiter.baseline)
     ))
     const reason = event?.data?.reason ?? event?.reason
     const failed = reason?.kind === 'error' || reason?.type === 'error' || reason?.error
-    for (const [key, waiter] of waiterEntries) {
+    for (const [key, waiter] of entries) {
       this.waiters.delete(key)
       clearTimeout(waiter.timeout)
       clearTimeout(waiter.slowTimer)
-      if (failed) waiter.reject(new Error(reason?.message || reason?.error || 'DSH 回合失败'))
+      if (failed) waiter.reject(new Error(reason?.message || reason?.error?.message || reason?.error || 'DSH turn failed'))
       else waiter.resolve(state?.text || '')
     }
     this.turns.delete(sessionId)
   }
 
-  // Implemented by subclasses.
   _startStream() {}
   _stopStream() {}
   async _ensureSession() { throw new Error('Transport does not implement ensureSession') }

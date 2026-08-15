@@ -1,98 +1,143 @@
-// src/core/store.mjs — 本地 session/ 持久化
-//
-// 目录结构（默认 <project>/session/）：
-//   bot.json                 登录 token / baseUrl / get_updates_buf 游标
-//   users.json               微信用户 -> DSH 会话映射
-//   history/<userKey>.jsonl  双方对话镜像：每行 {t, role:'user'|'assistant', text}
-//
-// 所有写入都是原子写（临时文件 + rename），崩溃不会留半截文件。
-
+import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 
+function readJson(file, fallback = {}) {
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')) } catch { return fallback }
+}
+
 function atomicWrite(file, text) {
   fs.mkdirSync(path.dirname(file), { recursive: true })
-  const tmp = file + '.tmp'
-  fs.writeFileSync(tmp, text, 'utf8')
-  fs.renameSync(tmp, file)
+  const temporary = `${file}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`
+  fs.writeFileSync(temporary, text, { encoding: 'utf8', mode: 0o600 })
+  fs.renameSync(temporary, file)
 }
 
-/** userKey（含 @ 等字符）转成安全的文件名片段 */
+function processExists(pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return error?.code === 'EPERM'
+  }
+}
+
 export function safeKey(userKey) {
-  return userKey.replace(/[^a-zA-Z0-9_-]/g, '_')
+  const source = String(userKey)
+  const readable = source.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 48) || 'user'
+  return `${readable}-${crypto.createHash('sha256').update(source).digest('hex').slice(0, 10)}`
 }
 
+/** Durable state shared by plugin and standalone modes. */
 export class Store {
-  /**
-   * @param {string} dir session 目录（绝对路径）
-   */
   constructor(dir) {
-    this.dir = dir
-    this.botFile = path.join(dir, 'bot.json')
-    this.usersFile = path.join(dir, 'users.json')
-    this.historyDir = path.join(dir, 'history')
+    this.dir = path.resolve(dir)
+    this.botFile = path.join(this.dir, 'bot.json')
+    this.usersFile = path.join(this.dir, 'users.json')
+    this.settingsFile = path.join(this.dir, 'settings.json')
+    this.historyDir = path.join(this.dir, 'history')
+    this.errorFile = path.join(this.dir, 'errors.jsonl')
+    this.lockFile = path.join(this.dir, 'dsh-weixin.lock')
+    this.hasLock = false
   }
 
-  // ── bot 状态（token/游标）──
+  loadBot() { return readJson(this.botFile) }
+  saveBot(state) { atomicWrite(this.botFile, JSON.stringify(state, null, 2) + '\n') }
+  loadUsers() { return readJson(this.usersFile) }
+  loadSettings() { return readJson(this.settingsFile) }
 
-  loadBot() {
-    try {
-      return JSON.parse(fs.readFileSync(this.botFile, 'utf8'))
-    } catch {
-      return {}
-    }
+  saveSettings(settings) {
+    atomicWrite(this.settingsFile, JSON.stringify(settings, null, 2) + '\n')
+    return settings
   }
 
-  saveBot(state) {
-    atomicWrite(this.botFile, JSON.stringify(state, null, 2) + '\n')
+  updateSettings(patch) {
+    return this.saveSettings({ ...this.loadSettings(), ...patch, updatedAt: new Date().toISOString() })
   }
 
-  // ── 用户 -> 会话映射 ──
-
-  loadUsers() {
-    try {
-      return JSON.parse(fs.readFileSync(this.usersFile, 'utf8'))
-    } catch {
-      return {}
-    }
+  getUser(userKey) {
+    return this.loadUsers()[String(userKey)] || null
   }
 
-  /** 记录/刷新用户与会话的映射 */
-  touchUser(userKey, sessionId, contextToken) {
+  touchUser(userKey, sessionId, contextToken, extra = {}) {
+    const key = String(userKey)
     const users = this.loadUsers()
-    users[userKey] = {
+    users[key] = {
+      ...users[key],
+      ...extra,
       sessionId,
-      createdAt: users[userKey]?.createdAt ?? new Date().toISOString(),
+      createdAt: users[key]?.createdAt ?? new Date().toISOString(),
       lastActiveAt: new Date().toISOString(),
       ...(contextToken ? { lastContextToken: contextToken } : {}),
     }
     atomicWrite(this.usersFile, JSON.stringify(users, null, 2) + '\n')
-    return users[userKey]
+    return users[key]
   }
-
-  // ── 双方对话镜像 ──
 
   historyFile(userKey) {
-    return path.join(this.historyDir, safeKey(userKey) + '.jsonl')
+    return path.join(this.historyDir, `${safeKey(userKey)}.jsonl`)
   }
 
-  /** 追加一条对话记录（微信用户 query 或 DSH 回复），双方都存 */
-  appendHistory(userKey, role, text) {
+  appendHistory(userKey, role, text, extra = {}) {
     const file = this.historyFile(userKey)
-    const line = JSON.stringify({ t: Date.now(), role, text }) + '\n'
+    const line = JSON.stringify({ t: Date.now(), role, text: String(text), ...extra }) + '\n'
     fs.mkdirSync(path.dirname(file), { recursive: true })
     fs.appendFileSync(file, line, 'utf8')
   }
 
-  /** 读取某用户的完整对话镜像（按时间正序） */
-  readHistory(userKey) {
+  readHistory(userKey, limit = Infinity) {
     try {
-      return fs.readFileSync(this.historyFile(userKey), 'utf8')
-        .split('\n')
+      const rows = fs.readFileSync(this.historyFile(userKey), 'utf8')
+        .split(/\r?\n/)
         .filter(Boolean)
-        .map((line) => JSON.parse(line))
+        .map(line => JSON.parse(line))
+      return Number.isFinite(limit) ? rows.slice(-Math.max(0, limit)) : rows
     } catch {
       return []
     }
+  }
+
+  appendError(scope, error, details = {}) {
+    const row = {
+      t: Date.now(),
+      scope,
+      message: error?.message ?? String(error),
+      stack: error?.stack,
+      ...details,
+    }
+    fs.mkdirSync(this.dir, { recursive: true })
+    fs.appendFileSync(this.errorFile, JSON.stringify(row) + '\n', 'utf8')
+  }
+
+  readErrors(limit = 50) {
+    try {
+      return fs.readFileSync(this.errorFile, 'utf8').split(/\r?\n/).filter(Boolean)
+        .slice(-Math.max(1, limit)).map(line => JSON.parse(line))
+    } catch {
+      return []
+    }
+  }
+
+  /** Refuse two bot runtimes using the same session directory. */
+  acquireLock() {
+    fs.mkdirSync(this.dir, { recursive: true })
+    const existing = readJson(this.lockFile, null)
+    if (existing?.pid !== process.pid && processExists(existing?.pid)) {
+      throw new Error(`dsh-weixin 已在运行（PID ${existing.pid}，数据目录 ${this.dir}）`)
+    }
+    atomicWrite(this.lockFile, JSON.stringify({ pid: process.pid, startedAt: Date.now() }) + '\n')
+    this.hasLock = true
+  }
+
+  releaseLock() {
+    if (!this.hasLock) return
+    const existing = readJson(this.lockFile, null)
+    if (existing?.pid === process.pid) {
+      try { fs.unlinkSync(this.lockFile) } catch (error) {
+        if (error?.code !== 'ENOENT') throw error
+      }
+    }
+    this.hasLock = false
   }
 }

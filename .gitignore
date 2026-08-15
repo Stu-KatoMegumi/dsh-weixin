@@ -1,6 +1,10 @@
 node_modules/
-/dsh/
 session/
 state/
 *.tmp
 others
+test
+
+
+# agents 有关
+AGENTS.md

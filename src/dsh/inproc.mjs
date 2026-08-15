@@ -1,8 +1,8 @@
 import crypto from 'node:crypto'
 import { BaseTransport, unwrapResult } from './transport.mjs'
 
-function sessionIdFor(userKey) {
-  const digest = crypto.createHash('sha256').update(String(userKey)).digest('hex').slice(0, 32)
+function sessionIdFor(userKey, salt = '') {
+  const digest = crypto.createHash('sha256').update(`${String(userKey)}:${salt}`).digest('hex').slice(0, 32)
   return `wx-${digest}`
 }
 
@@ -13,7 +13,7 @@ function workspaceFor(items, cwd, title) {
 }
 
 export class InprocTransport extends BaseTransport {
-  constructor(apiProxy, { preset = 'weixin', sessionCwd = process.cwd(), workspaceTitle = '微信会话', ...options } = {}) {
+  constructor(apiProxy, { preset = 'standard', sessionCwd = process.cwd(), workspaceTitle = '微信会话', ...options } = {}) {
     super(options)
     this.api = apiProxy
     this.preset = preset
@@ -51,8 +51,8 @@ export class InprocTransport extends BaseTransport {
     this.streamTask = null
   }
 
-  async _ensureSession(userKey) {
-    const sessionId = sessionIdFor(userKey)
+  async _ensureSession(userKey, { fresh = false, sessionId: requestedId } = {}) {
+    const sessionId = requestedId || sessionIdFor(userKey, fresh ? crypto.randomUUID() : '')
     let workspace
     try {
       const listing = await this.call('workspace', 'list', {})
@@ -111,6 +111,11 @@ export class InprocTransport extends BaseTransport {
       model: model.model,
       ...(model.reasoningEffort ? { reasoningEffort: model.reasoningEffort } : {}),
     }))?.selected || model
+  }
+
+  async _status(sessionId) {
+    const history = await this.call('sessions', 'history', { sessionId, maxMessages: 1 })
+    return { sessionId, exists: true, hasMore: history?.hasMore === true }
   }
 
   async _respondQuestion(rpcId, sessionId, questions, text) {

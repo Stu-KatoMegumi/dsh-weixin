@@ -2,5 +2,5 @@
     - id: dsh-weixin
       name: '@deepseek-ai/dsh-weixin'
       config:
-        preset: weixin
-        workspaceTitle: 微信会话
+        preset: standard
+        workspaceTitle: 微信DSH

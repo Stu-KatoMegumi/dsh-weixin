@@ -1,8 +1,8 @@
 import crypto from 'node:crypto'
 import { BaseTransport, unwrapResult } from './transport.mjs'
 
-function sessionIdFor(userKey) {
-  const digest = crypto.createHash('sha256').update(String(userKey)).digest('hex').slice(0, 32)
+function sessionIdFor(userKey, salt = '') {
+  const digest = crypto.createHash('sha256').update(`${String(userKey)}:${salt}`).digest('hex').slice(0, 32)
   return `wx-${digest}`
 }
 
@@ -13,22 +13,31 @@ function workspaceFor(items, cwd, title) {
 }
 
 export class HttpTransport extends BaseTransport {
-  constructor({ base = 'http://127.0.0.1:3080', preset = 'weixin', sessionCwd = process.cwd(), workspaceTitle = '微信会话', ...options } = {}) {
+  constructor({
+    base = 'http://127.0.0.1:3080',
+    preset = 'standard',
+    sessionCwd = process.cwd(),
+    workspaceTitle = '微信会话',
+    fetchImpl = globalThis.fetch,
+    ...options
+  } = {}) {
     super(options)
     this.base = String(base).replace(/\/$/, '')
     this.preset = preset
     this.sessionCwd = sessionCwd
     this.workspaceTitle = workspaceTitle
+    this.fetch = fetchImpl
     this.abortController = null
     this.streamTask = null
   }
 
-  async call(method, payload) {
+  async call(method, payload, { signal } = {}) {
     const rpcId = `dsh-weixin-${crypto.randomUUID()}`
-    const response = await fetch(`${this.base}/api/${method}`, {
+    const response = await this.fetch(`${this.base}/api/${method}`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ type: 'client-request', rpcId, method, payload }),
+      signal,
     })
     const body = await response.json().catch(() => null)
     if (!response.ok) throw new Error(`DSH HTTP ${method} failed: ${response.status}`)
@@ -36,8 +45,15 @@ export class HttpTransport extends BaseTransport {
     return unwrapResult(body)
   }
 
+  /** Verify that the configured endpoint is a responsive DSH Web API. */
+  async probe({ timeoutMs = 3000 } = {}) {
+    return this.call('agentPreset.list', {}, {
+      signal: AbortSignal.timeout(Math.max(100, Number(timeoutMs) || 3000)),
+    })
+  }
+
   async respond(message) {
-    const response = await fetch(`${this.base}/api/respond`, {
+    const response = await this.fetch(`${this.base}/api/respond`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(message),
@@ -50,7 +66,7 @@ export class HttpTransport extends BaseTransport {
     const signal = this.abortController.signal
     this.streamTask = (async () => {
       try {
-        const response = await fetch(`${this.base}/api/events.mux`, { signal, headers: { accept: 'text/event-stream' } })
+        const response = await this.fetch(`${this.base}/api/events.mux`, { signal, headers: { accept: 'text/event-stream' } })
         if (!response.ok || !response.body) throw new Error(`DSH event stream failed: HTTP ${response.status}`)
         const reader = response.body.getReader()
         const decoder = new TextDecoder()
@@ -89,8 +105,8 @@ export class HttpTransport extends BaseTransport {
     this.streamTask = null
   }
 
-  async _ensureSession(userKey) {
-    const sessionId = sessionIdFor(userKey)
+  async _ensureSession(userKey, { fresh = false, sessionId: requestedId } = {}) {
+    const sessionId = requestedId || sessionIdFor(userKey, fresh ? crypto.randomUUID() : '')
     let workspace
     try {
       const listing = await this.call('workspace.list', {})
@@ -133,6 +149,11 @@ export class HttpTransport extends BaseTransport {
       model: model.model,
       ...(model.reasoningEffort ? { reasoningEffort: model.reasoningEffort } : {}),
     }))?.selected || model
+  }
+
+  async _status(sessionId) {
+    const history = await this.call('session.history', { sessionId, maxMessages: 1 })
+    return { sessionId, exists: true, hasMore: history?.hasMore === true }
   }
 
   async _respondQuestion(rpcId, sessionId, questions, text) {

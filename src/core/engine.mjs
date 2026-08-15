@@ -1,16 +1,54 @@
-// src/core/engine.mjs — 核心编排（两种模式共享）
-//
-// 流程：微信消息 → 复杂度判断 →（复杂：先回"好的，我先思考一下"+ 切思考模型）
-//       → 保证会话存在（含「微信会话」分组）→ 存入本地历史 → 发送给 DSH 解答 →
-//       回复存入本地历史 → 转发回微信显示。
-// 附带：agent 提问转发微信并自动应答、慢任务兜底"正在处理"、长回复分块。
-
+import fs from 'node:fs'
+import path from 'node:path'
 import { formatQuestions } from './wechat.mjs'
+import { safeTextCut } from './format.mjs'
+import { cronMatches, minuteKey } from './scheduler.mjs'
 
-/** 复杂任务关键词（命中即判定为长任务，先思考确认再执行） */
-const ACTION_RE = /(写|改|创建|生成|删除|移动|复制|运行|执行|启动|停止|安装|下载|上传|搜索|查询|查找|分析|总结|整理|重构|调试|测试|构建|打包|部署|提交|推送|合并|克隆|备份|翻译|转换|压缩|解压|读取|查看|打开|列出|统计|计算|规划|设计|开发|实现|排查|修复|对比|监控|定时|任务|项目|文件|代码|脚本|命令|目录|文件夹|网页|接口|docker|git|npm|pnpm|node|python|pip|ssh|数据库|mysql|redis|sql|api)/i
+const ACTION_RE = /(写|改|创建|生成|删除|移动|复制|运行|执行|启动|停止|安装|下载|上传|搜索|查询|查找|分析|总结|整理|重构|调试|测试|构建|打包|部署|提交|推送|合并|克隆|备份|翻译|转换|解压|代码|脚本|命令|文件|项目|docker|git|npm|pnpm|node|python|pip|ssh|sql|api)/i
 
-/** 从环境变量解析模型路由配置（默认：简单→flash 关思考，复杂→pro 高思考） */
+function stringList(value) {
+  if (Array.isArray(value)) return value.map(String).map(item => item.trim()).filter(Boolean)
+  return String(value || '').split(/[\s,;\n]+/).map(item => item.trim()).filter(Boolean)
+}
+
+function bool(value, fallback) {
+  if (value === undefined || value === null || value === '') return fallback
+  if (typeof value === 'string') return !['0', 'false', 'off', 'no'].includes(value.toLowerCase())
+  return Boolean(value)
+}
+
+function sessionIdFrom(value) {
+  return value?.sessionId || value?.session?.sessionId || value?.session?.id || value?.id
+}
+
+function within(root, candidate) {
+  const relative = path.relative(root, candidate)
+  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative))
+}
+
+export function normalizeConfig(config = {}) {
+  return {
+    enabled: bool(config.enabled, true),
+    streaming: bool(config.streaming, true),
+    typing: bool(config.typing, true),
+    mediaEnabled: bool(config.mediaEnabled, true),
+    renewalEnabled: bool(config.renewalEnabled, true),
+    accessPolicy: ['pairing', 'allowlist', 'disabled'].includes(config.accessPolicy) ? config.accessPolicy : 'pairing',
+    allowlist: stringList(config.allowlist),
+    admins: stringList(config.admins),
+    slowAckMs: Number(config.slowAckMs ?? 4000),
+    turnTimeoutMs: Number(config.turnTimeoutMs ?? 15 * 60 * 1000),
+    streamFlushChars: Math.max(40, Number(config.streamFlushChars ?? 240)),
+    streamFlushMs: Math.max(100, Number(config.streamFlushMs ?? 900)),
+    maintenanceIntervalMs: Math.max(10_000, Number(config.maintenanceIntervalMs ?? 60_000)),
+    complexAckText: String(config.complexAckText || '好的，我先思考一下，稍后给你结果。'),
+    fastModel: config.fastModel ?? null,
+    complexModel: config.complexModel ?? null,
+    outboxDir: path.resolve(config.outboxDir || path.join(config.sessionCwd || process.cwd(), 'outbox')),
+    jobs: Array.isArray(config.jobs) ? config.jobs : [],
+  }
+}
+
 export function modelConfig(env = process.env) {
   const spec = (model, reasoning) => {
     if (!model) return null
@@ -18,179 +56,351 @@ export function modelConfig(env = process.env) {
     return {
       provider: slash > 0 ? model.slice(0, slash) : 'deepseek-official',
       model: slash > 0 ? model.slice(slash + 1) : model,
-      reasoningEffort: reasoning ? String(reasoning).toLowerCase() : undefined, // 目录里 effort id 是小写
+      reasoningEffort: reasoning ? String(reasoning).toLowerCase() : undefined,
     }
   }
   return {
     fastModel: spec(env.WX_BOT_FAST_MODEL || 'deepseek-official/deepseek-v4-flash', env.WX_BOT_FAST_REASONING || 'off'),
     complexModel: spec(env.WX_BOT_COMPLEX_MODEL || 'deepseek-official/deepseek-v4-pro', env.WX_BOT_COMPLEX_REASONING || 'high'),
-    complexAckText: env.WX_BOT_COMPLEX_ACK_TEXT || '好的，我先思考一下，稍后给你结果…',
+    complexAckText: env.WX_BOT_COMPLEX_ACK_TEXT || '好的，我先思考一下，稍后给你结果。',
+  }
+}
+
+class StreamRelay {
+  constructor({ wechat, to, token, enabled, flushChars, flushMs }) {
+    this.wechat = wechat
+    this.to = to
+    this.token = token
+    this.enabled = enabled
+    this.flushChars = flushChars
+    this.flushMs = flushMs
+    this.buffer = ''
+    this.all = ''
+    this.sent = false
+    this.timer = null
+    this.chain = Promise.resolve()
+  }
+
+  push(delta) {
+    if (!this.enabled || !delta) return
+    this.buffer += delta
+    this.all += delta
+    if (this.buffer.length >= this.flushChars) this.flush(false)
+    else if (!this.timer) this.timer = setTimeout(() => this.flush(true), this.flushMs)
+  }
+
+  flush(force) {
+    clearTimeout(this.timer)
+    this.timer = null
+    if (!this.buffer) return
+    let count = this.buffer.length
+    if (!force && count < this.flushChars) return this.#arm()
+    if (!force) count = safeTextCut(this.buffer, this.flushChars)
+    const part = this.buffer.slice(0, count)
+    this.buffer = this.buffer.slice(count)
+    if (!part.trim()) return this.#arm()
+    this.sent = true
+    this.chain = this.chain.then(() => this.wechat.sendText(this.to, this.token, part))
+    if (this.buffer) this.#arm()
+  }
+
+  #arm() {
+    if (!this.timer && this.buffer) this.timer = setTimeout(() => this.flush(true), this.flushMs)
+  }
+
+  async finish(finalText) {
+    clearTimeout(this.timer)
+    this.timer = null
+    if (this.enabled) this.flush(true)
+    await this.chain
+    if (!this.sent) await this.wechat.sendText(this.to, this.token, finalText || '（DSH 没有返回文本内容）')
   }
 }
 
 export class Engine {
-  /**
-   * @param {object} deps
-   * @param {import('./wechat.mjs').WeChatClient} deps.wechat
-   * @param {import('./store.mjs').Store} deps.store
-   * @param {import('../dsh/transport.mjs').BaseTransport} deps.transport
-   * @param {object} deps.config { slowAckMs, turnTimeoutMs, fastModel, complexModel, complexAckText }
-   */
-  constructor({ wechat, store, transport, config }) {
+  constructor({ wechat, store, transport, config = {} }) {
     this.wechat = wechat
     this.store = store
     this.transport = transport
-    this.slowAckMs = config.slowAckMs ?? 4000
-    this.turnTimeoutMs = config.turnTimeoutMs ?? 15 * 60 * 1000
-    this.fastModel = config.fastModel ?? null
-    this.complexModel = config.complexModel ?? null
-    this.complexAckText = config.complexAckText ?? '好的，我先思考一下，稍后给你结果…'
-    this.userBySession = new Map() // sessionId -> { from, token }
+    this.baseConfig = { ...config }
+    this.config = normalizeConfig({ ...config, ...store.loadSettings() })
+    this.userBySession = new Map()
     this.started = false
+    this.maintenanceTimer = null
+    this.jobRuns = new Map()
   }
 
   start() {
     if (this.started) return
+    this.store.acquireLock()
     this.started = true
     this.transport.onQuestion = (rpcId, sessionId, questions) => this.#forwardQuestion(rpcId, sessionId, questions)
-    this.transport.onSlow = (sessionId) => this.#slowAck(sessionId)
-    this.transport.onStall = (sessionId) => {
-      console.warn(`[engine] 会话 ${sessionId} 发起审批，请在 DSH Web 界面处理`)
-    }
+    this.transport.onSlow = sessionId => this.#slowAck(sessionId)
+    this.transport.onStall = value => console.warn('[engine] DSH 通道告警:', value)
     this.transport.start()
-    // 微信侧：先确保登录，再开始长轮询（不阻塞启动）
-    void (async () => {
-      try {
-        await this.wechat.ensureLogin()
-        console.log('[engine] 开始长轮询收消息…')
-        await this.wechat.startPolling((msg) => this.handleWechatMessage(msg))
-      } catch (error) {
-        console.error('[engine] 微信通道启动失败:', error.message)
-      }
-    })()
+    this.maintenanceTimer = setInterval(() => void this.#maintenance(), this.config.maintenanceIntervalMs)
+    this.maintenanceTimer.unref?.()
+    void this.#startWechat()
+  }
+
+  async #startWechat() {
+    try {
+      await this.wechat.ensureLogin()
+      console.log('[engine] 微信通道已启动，正在接收消息')
+      await this.wechat.startPolling(message => this.handleWechatMessage(message))
+    } catch (error) {
+      this.store.appendError('wechat.start', error)
+      console.error('[engine] 微信通道启动失败:', error.message)
+    }
   }
 
   stop() {
+    if (!this.started) return
     this.started = false
+    clearInterval(this.maintenanceTimer)
+    this.maintenanceTimer = null
     this.wechat.stop()
     this.transport.stop()
+    this.store.releaseLock()
   }
 
-  // ── 微信消息入口 ──
+  getSettings() { return { ...this.config } }
+
+  updateSettings(patch) {
+    const allowed = [
+      'enabled', 'streaming', 'typing', 'mediaEnabled', 'renewalEnabled', 'accessPolicy',
+      'allowlist', 'admins', 'slowAckMs', 'turnTimeoutMs', 'streamFlushChars', 'streamFlushMs',
+      'complexAckText', 'outboxDir', 'jobs',
+    ]
+    const clean = Object.fromEntries(Object.entries(patch || {}).filter(([key]) => allowed.includes(key)))
+    const stored = this.store.updateSettings(clean)
+    this.config = normalizeConfig({ ...this.baseConfig, ...stored })
+    return this.getSettings()
+  }
+
+  status() {
+    return {
+      started: this.started,
+      wechat: this.wechat.status(),
+      settings: this.getSettings(),
+      users: Object.keys(this.store.loadUsers()).length,
+      recentErrors: this.store.readErrors(10),
+    }
+  }
 
   async handleWechatMessage(msg) {
-    if (msg.message_type !== 1) return // 只处理用户消息（BOT 发出的 type=2 不回环）
-    if (msg.group_id) {
-      console.log('[engine] 跳过群消息（当前只处理单聊）:', msg.group_id)
+    if (msg?.message_type !== 1 || msg?.group_id || !msg?.from_user_id) return
+    const userKey = String(msg.from_user_id)
+    const contextToken = msg.context_token || ''
+    this.wechat.rememberContext(userKey, contextToken)
+    if (!this.#allowed(userKey)) {
+      if (this.config.accessPolicy !== 'disabled') {
+        await this.wechat.sendText(userKey, contextToken, '该微信账号尚未获得 dsh-weixin 访问权限。')
+      }
       return
     }
-    const text = msg.item_list?.find((item) => item.type === 1)?.text_item?.text
+
+    const textItem = msg.item_list?.find(item => item.type === 1 && item.text_item?.text)
+    let text = String(textItem?.text || '').trim()
+    let media = []
+    if (this.config.mediaEnabled) media = await this.wechat.downloadMedia(msg, userKey)
+    if (media.length) {
+      const attachmentText = media.map(item => `- ${item.kind}: ${item.savedPath} (${item.size} bytes)`).join('\n')
+      text = `${text}${text ? '\n\n' : ''}用户从微信发来了以下附件，请根据需要读取和处理：\n${attachmentText}`
+    }
     if (!text) {
-      await this.wechat.sendText(msg.from_user_id, msg.context_token, '暂时只支持文字消息')
+      await this.wechat.sendText(userKey, contextToken, this.config.mediaEnabled
+        ? '暂时无法识别这条消息。'
+        : '当前已关闭媒体接收，请发送文字。')
       return
     }
 
-    const userKey = msg.from_user_id
-    const { sessionId } = await this.transport.ensureSession(userKey)
-    this.store.touchUser(userKey, sessionId, msg.context_token)
-    this.userBySession.set(sessionId, { from: userKey, token: msg.context_token })
+    try {
+      const record = await this.#ensureUser(userKey, contextToken)
+      if (text.startsWith('/')) {
+        await this.#command(userKey, contextToken, record.sessionId, text)
+        return
+      }
+      await this.#runTurn(userKey, contextToken, record.sessionId, text)
+    } catch (error) {
+      this.store.appendError('message', error, { userKey })
+      console.error('[engine] 消息处理失败:', error.message)
+      await this.wechat.setTyping(userKey, contextToken, false)
+      await this.wechat.sendText(userKey, contextToken, `处理失败：${error.message}`).catch(() => {})
+    }
+  }
 
-    // 若该会话正被 agent 提问挂起，则把这条消息作为回答提交，而不是开新回合
+  async #ensureUser(userKey, contextToken) {
+    const saved = this.store.getUser(userKey)
+    const created = await this.transport.ensureSession(userKey, saved?.sessionId ? { sessionId: saved.sessionId } : {})
+    const sessionId = sessionIdFrom(created) || saved?.sessionId
+    if (!sessionId) throw new Error('DSH 未返回会话 ID')
+    const record = this.store.touchUser(userKey, sessionId, contextToken)
+    this.userBySession.set(sessionId, { from: userKey, token: contextToken })
+    return record
+  }
+
+  async #runTurn(userKey, contextToken, sessionId, text) {
     const pending = this.transport.pendingQuestion(sessionId)
     if (pending) {
       this.store.appendHistory(userKey, 'user', text)
-      console.log(`[engine] ${userKey} 回答提问 ${pending.rpcId.slice(0, 8)}: ${text.slice(0, 80)}`)
-      try {
-        await this.transport.answerQuestion(pending.rpcId, sessionId, text)
-        await this.wechat.sendText(userKey, msg.context_token, '已收到你的回答，继续处理中…')
-      } catch (error) {
-        console.error('[engine] 提交回答失败:', error.message)
-        await this.wechat.sendText(userKey, msg.context_token, `提交回答失败：${error.message}`)
-      }
+      await this.transport.answerQuestion(pending.rpcId, sessionId, text)
+      await this.wechat.sendText(userKey, contextToken, '已收到你的回答，继续处理中。')
       return
     }
 
     this.store.appendHistory(userKey, 'user', text)
-    console.log(`[engine] ${userKey}: ${text.slice(0, 80)}  -> 会话 ${sessionId}`)
+    const complex = text.length > 40 || ACTION_RE.test(text)
+    if (complex && !this.config.streaming) await this.wechat.sendText(userKey, contextToken, this.config.complexAckText)
+    await this.#selectModel(sessionId, complex ? this.config.complexModel : this.config.fastModel)
+    if (this.config.typing) await this.wechat.setTyping(userKey, contextToken, true)
+    const relay = new StreamRelay({
+      wechat: this.wechat,
+      to: userKey,
+      token: contextToken,
+      enabled: this.config.streaming,
+      flushChars: this.config.streamFlushChars,
+      flushMs: this.config.streamFlushMs,
+    })
     try {
-      // 复杂度判断：复杂任务先回"好的，我先思考一下"并切思考模型；简单任务切快模型秒回
-      const complex = this.#isComplex(text)
-      let model = null
-      let slowMs = this.slowAckMs
-      if (complex) {
-        await this.wechat.sendText(userKey, msg.context_token, this.complexAckText)
-        model = await this.#selectModel(sessionId, this.complexModel)
-        slowMs = 0 // 已有"思考中"文案，关闭 4 秒兜底提示
-      } else {
-        model = await this.#selectModel(sessionId, this.fastModel)
-      }
       const reply = await this.transport.ask(sessionId, text, {
-        timeoutMs: this.turnTimeoutMs,
-        slowMs,
+        timeoutMs: this.config.turnTimeoutMs,
+        slowMs: complex ? 0 : this.config.slowAckMs,
+        onDelta: delta => relay.push(delta),
       })
-      const out = reply || '（DSH 没有返回内容）'
-      this.store.appendHistory(userKey, 'assistant', out)
-      await this.wechat.sendText(userKey, msg.context_token, out)
-      console.log(
-        `[engine] 回合完成（${complex ? '复杂' : '简单'}` +
-        (model ? `，模型=${model.model}/${model.reasoningEffort || '默认'}` : '') + '）',
-      )
-    } catch (error) {
-      console.error('[engine] 回合失败:', error.message)
-      await this.wechat.sendText(userKey, msg.context_token, `出错：${error.message}`)
+      this.store.appendHistory(userKey, 'assistant', reply || '')
+      await relay.finish(reply)
+    } finally {
+      if (this.config.typing) await this.wechat.setTyping(userKey, contextToken, false)
     }
   }
 
-  // ── 内部：复杂度判断与模型路由 ──
-
-  /** 短文本且无动作关键词 = 简单任务（秒回）；否则视为复杂任务（先思考） */
-  #isComplex(text) {
-    if (text.length > 40) return true
-    return ACTION_RE.test(text)
+  async #command(userKey, token, sessionId, input) {
+    const [command, ...args] = input.trim().split(/\s+/)
+    const admin = this.config.admins.includes(userKey)
+    if (command === '/help') {
+      await this.wechat.sendText(userKey, token, [
+        '🤖 dsh-weixin 命令',
+        '/new - 开始新会话', '/stop - 停止当前任务', '/status - 查看连接状态',
+        '/send <outbox内相对路径> - 发送文件', '/renew - 扫码续期',
+        ...(admin ? ['/users - 列出已知用户', '/allow add|remove <ID> - 管理白名单', '/cron - 列出定时任务'] : []),
+      ].join('\n'))
+      return
+    }
+    if (command === '/new') {
+      const created = await this.transport.ensureSession(userKey, { fresh: true })
+      const freshId = sessionIdFrom(created)
+      if (!freshId) throw new Error('DSH 创建新会话失败')
+      this.store.touchUser(userKey, freshId, token)
+      this.userBySession.set(freshId, { from: userKey, token })
+      await this.wechat.sendText(userKey, token, `已开始新会话：${freshId}`)
+      return
+    }
+    if (command === '/stop') {
+      await this.transport.cancel(sessionId)
+      await this.wechat.sendText(userKey, token, '已请求停止当前任务。')
+      return
+    }
+    if (command === '/status') {
+      const state = this.wechat.status()
+      await this.wechat.sendText(userKey, token, `微信：${state.connected ? '已连接' : '未连接'}\n流式输出：${this.config.streaming ? '开' : '关'}\n会话：${sessionId}\n最近轮询：${state.lastSuccessAt ? new Date(state.lastSuccessAt).toLocaleString() : '无'}`)
+      return
+    }
+    if (command === '/renew') {
+      const url = await this.wechat.beginRenewal(userKey, { notify: false })
+      await this.wechat.sendText(userKey, token, `续期二维码链接：\n${url}`)
+      return
+    }
+    if (command === '/send') {
+      const requested = args.join(' ')
+      if (!requested) throw new Error('用法：/send <outbox 内的相对路径>')
+      const candidate = path.resolve(this.config.outboxDir, requested)
+      if (!within(this.config.outboxDir, candidate)) throw new Error('只能发送 outbox 目录内的文件')
+      if (!fs.statSync(candidate).isFile()) throw new Error('目标不是文件')
+      await this.wechat.sendFile(userKey, token, candidate)
+      return
+    }
+    if (command === '/users' && admin) {
+      await this.wechat.sendText(userKey, token, Object.entries(this.store.loadUsers())
+        .map(([id, value]) => `${id}  ${value.lastActiveAt || ''}`).join('\n') || '暂无用户')
+      return
+    }
+    if (command === '/cron' && admin) {
+      const lines = this.config.jobs.map(job => `${job.enabled === false ? '⏸' : '▶'} ${job.id || '-'}  ${job.cron || '-'}  ${job.userId || '-'}`)
+      await this.wechat.sendText(userKey, token, lines.join('\n') || '暂无定时任务')
+      return
+    }
+    if (command === '/allow' && admin) {
+      const [operation, target] = args
+      if (!['add', 'remove'].includes(operation) || !target) throw new Error('用法：/allow add|remove <用户ID>')
+      const allowlist = new Set(this.config.allowlist)
+      if (operation === 'add') allowlist.add(target)
+      else allowlist.delete(target)
+      this.updateSettings({ allowlist: [...allowlist] })
+      await this.wechat.sendText(userKey, token, `白名单已更新，共 ${allowlist.size} 个用户。`)
+      return
+    }
+    await this.wechat.sendText(userKey, token, '未知命令，发送 /help 查看用法。')
   }
 
-  /** 切换会话模型；失败不阻塞（沿用会话当前模型） */
+  #allowed(userKey) {
+    if (!this.config.enabled || this.config.accessPolicy === 'disabled') return false
+    if (this.config.admins.includes(userKey)) return true
+    return this.config.accessPolicy !== 'allowlist' || this.config.allowlist.includes(userKey)
+  }
+
   async #selectModel(sessionId, spec) {
-    if (!spec || typeof this.transport.selectModel !== 'function') return null
-    try {
-      await this.transport.selectModel(sessionId, spec)
-      return spec
-    } catch (error) {
-      console.warn(`[engine] 模型切换失败（${spec.provider}/${spec.model}）: ${error.message}`)
-      return null
+    if (!spec) return
+    try { await this.transport.selectModel(sessionId, spec) } catch (error) {
+      console.warn(`[engine] 模型切换失败，继续使用当前模型：${error.message}`)
     }
   }
-
-  // ── 内部：定位微信用户（优先本次运行见过的，其次本地 users.json 兜底）──
 
   #userOf(sessionId) {
     const direct = this.userBySession.get(sessionId)
     if (direct) return direct
-    const users = this.store.loadUsers()
-    for (const [key, rec] of Object.entries(users)) {
-      if (rec.sessionId === sessionId && rec.lastContextToken) {
-        return { from: key, token: rec.lastContextToken }
-      }
+    for (const [from, record] of Object.entries(this.store.loadUsers())) {
+      if (record.sessionId === sessionId && record.lastContextToken) return { from, token: record.lastContextToken }
     }
     return null
   }
 
   #forwardQuestion(rpcId, sessionId, questions) {
     const user = this.#userOf(sessionId)
-    if (!user) {
-      console.warn(`[engine] 会话 ${sessionId} 有提问但找不到对应微信用户，请在 Web 界面处理`)
-      return
-    }
-    void this.wechat.sendText(user.from, user.token, formatQuestions(questions)).catch((error) => {
-      console.error('[engine] 转发提问失败:', error.message)
+    if (!user) return console.warn(`[engine] 会话 ${sessionId} 的提问无法定位微信用户`)
+    void this.wechat.sendText(user.from, user.token, formatQuestions(questions)).catch(error => {
+      this.store.appendError('question.forward', error, { sessionId })
     })
   }
 
   #slowAck(sessionId) {
     const user = this.#userOf(sessionId)
-    if (!user) return
-    void this.wechat.sendText(user.from, user.token, '⏳ 收到，正在处理，完成后回复你…').catch((error) => {
-      console.error('[engine] 发送"正在处理"失败:', error.message)
-    })
+    if (user) void this.wechat.sendText(user.from, user.token, '⏳ 收到，正在处理，完成后回复你。').catch(() => {})
+  }
+
+  async #maintenance() {
+    if (!this.started) return
+    try {
+      const users = Object.entries(this.store.loadUsers()).sort((a, b) => String(b[1].lastActiveAt).localeCompare(String(a[1].lastActiveAt)))
+      const recipient = this.config.admins.find(id => this.store.getUser(id)?.lastContextToken) || users[0]?.[0]
+      if (this.config.renewalEnabled) await this.wechat.checkRenewal(recipient)
+      const now = new Date()
+      const key = minuteKey(now)
+      for (const job of this.config.jobs) {
+        if (job?.enabled === false || !job?.userId || !job?.prompt || !cronMatches(job.cron, now)) continue
+        const jobKey = `${job.id || job.prompt}:${key}`
+        if (this.jobRuns.has(jobKey)) continue
+        this.jobRuns.set(jobKey, Date.now())
+        const user = this.store.getUser(job.userId)
+        if (!user?.lastContextToken) continue
+        const record = await this.#ensureUser(job.userId, user.lastContextToken)
+        void this.#runTurn(job.userId, user.lastContextToken, record.sessionId, job.prompt).catch(error => {
+          this.store.appendError('cron', error, { jobId: job.id })
+        })
+      }
+      for (const [jobKey, at] of this.jobRuns) if (Date.now() - at > 3_600_000) this.jobRuns.delete(jobKey)
+    } catch (error) {
+      this.store.appendError('maintenance', error)
+    }
   }
 }

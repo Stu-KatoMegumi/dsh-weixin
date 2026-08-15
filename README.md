@@ -1,57 +1,88 @@
 # dsh-weixin
 
-`dsh-weixin` 是把微信 ClawBot/iLink 单聊消息接入 DSH agent 的官方 bundle 插件。插件模式使用 DSH 的 `apiProxy`，独立模式使用 DSH Web 的 HTTP + SSE API；两种模式共享微信客户端、会话持久化和回合编排逻辑。
+`dsh-weixin` 把微信 iLink/ClawBot 私聊接入 DSH agent。插件模式直接使用 DSH `apiProxy`，独立模式通过 DSH Web HTTP + SSE 连接。
 
-## 按官方方式安装到 DSH profile
+## 功能
 
-bundle 的根目录包含 `package.json`、`cordis.patch.yml` 和 `src/`。官方安装命令会把本目录作为 profile 的 link dependency，并自动维护 profile 的 `dsh.profile.bundles`：
+- DSH 事件流增量输出，按字符数/时间分段回传微信
+- 微信“正在输入”状态，任务结束自动关闭
+- 长轮询看门狗、指数退避重连和连接状态记录
+- 登录约 24 小时到期前生成新二维码，旧 token 在扫码前继续工作
+- 图片、语音、视频、文件接收（AES-128-ECB 解密）与文件发送
+- 白名单、管理员命令、发送目录边界和 50 MB 媒体上限
+- 用户→DSH 会话映射、对话历史、错误日志和单实例锁持久化
+- DSH“设置 → 微信”页面，支持状态、扫码、权限、流式参数和定时任务热更新
+- 五段 cron 定时提示任务
+
+## 安装到 DSH
 
 ```powershell
-# 在 DSH 源码 checkout 中执行（默认 DSH_ROOT 为 D:\Program Files\dsh）
-pnpm dsh plugin --profile web add "E:\path\to\dsh-weixin"
+# 可选：默认 DSH_ROOT 为 D:\Program Files\dsh，profile 为 web
+$env:DSH_ROOT = 'D:\Program Files\dsh'
+$env:DSH_PROFILE = 'web'
+npm install
+npm run install:dsh
+```
 
-# 验证组合后的配置
+安装脚本调用 DSH 官方 `plugin add` 逻辑。Windows 上源码路径含空格时，脚本会使用 `$DSH_HOME/bundles/dsh-weixin` 稳定缓存，避免生成无法解析的 profile 包链接。
+
+```powershell
+cd 'D:\Program Files\dsh'
 pnpm dsh --profile web --dump-config
-
-# 启动
 pnpm dsh --profile web
 ```
 
-也可以在本项目目录执行便利脚本；它只是上述官方命令的薄封装，不会复制源码或直接修改 DSH 的 patch：
+首次启动会打开扫码窗口。登录凭据、会话映射和设置默认持久保存在 `$DSH_HOME/channels/dsh-weixin`（通常是 `~/.dsh/channels/dsh-weixin`），更新或卸载插件不会删除它。
+
+## 卸载
 
 ```powershell
-$env:DSH_ROOT = 'D:\Program Files\dsh' # 可选
-$env:DSH_PROFILE = 'web'               # 可选，默认 web
-npm run install:dsh
 npm run uninstall:dsh
 ```
 
-若使用已安装的 `dsh` CLI 而不是源码 checkout，请把 `dsh` 放入 `PATH`；也可以用 `DSH_CLI` 指定 CLI 可执行文件。`npm install` 只安装本项目依赖，不会触发 DSH 插件注册。
+卸载会从指定 DSH profile 移除 bundle，并清理安装脚本创建的稳定缓存；不删除你的会话数据。
 
-`cordis.patch.yml` 使用包名引用插件入口：
+## 微信命令
 
-```yaml
-- insert:
-    - id: dsh-weixin
-      name: '@deepseek-ai/dsh-weixin'
-      config:
-        preset: weixin
-        workspaceTitle: 微信会话
+- `/help`：查看命令
+- `/new`：创建并切换到新 DSH 会话
+- `/stop`：取消当前任务
+- `/status`：查看连接和会话状态
+- `/renew`：立即生成扫码续期链接
+- `/send <相对路径>`：发送 `outboxDir` 内的文件
+- `/users`、`/allow add|remove <ID>`、`/cron`：管理员命令
+
+## 定时任务
+
+在设置页填写 JSON 数组：
+
+```json
+[
+  {
+    "id": "morning-summary",
+    "cron": "0 9 * * 1-5",
+    "userId": "微信用户ID",
+    "prompt": "总结今天的待办事项",
+    "enabled": true
+  }
+]
 ```
 
-## 独立运行
+cron 按运行 DSH 的本地时区解析，五个字段依次是分、时、日、月、星期。
+
+## 独立模式
 
 ```powershell
-npm install
 npm start
 ```
 
-独立模式默认连接 `http://127.0.0.1:3080`，可用 `DSH_URL`、`WX_BOT_CWD`、`WX_BOT_SESSION_DIR`、`WX_BOT_PRESET` 和 `WX_BOT_*_MODEL` 环境变量配置。首次运行微信通道仍需扫码登录。
+默认连接 `http://127.0.0.1:3080`。可使用 `DSH_URL`、`WX_BOT_CWD`、`WX_BOT_SESSION_DIR`、`WX_BOT_PRESET`、`WX_BOT_ACCESS_POLICY`、`WX_BOT_ALLOWLIST`、`WX_BOT_ADMINS`、`WX_BOT_STREAMING`、`WX_BOT_TYPING` 等环境变量。
 
-## 目录
+独立模式会在启动微信连接前调用只读 DSH API 检查服务。如果 DSH 未启动、地址错误或端口上不是 DSH，程序会提示先运行 `pnpm dsh web` 并以退出码 1 结束，不会启动扫码和微信轮询。检测超时默认为 3000 ms，可用 `DSH_STARTUP_CHECK_TIMEOUT_MS` 调整。
 
-- `src/plugin/index.mjs`：DSH Cordis 插件入口。
-- `src/dsh/inproc.mjs`：插件模式的 `apiProxy` transport。
-- `src/dsh/http.mjs`：独立模式的 HTTP RPC + SSE transport。
-- `src/dsh/transport.mjs`：会话回合、流式文本、提问回答和超时处理。
-- `src/core/`：微信客户端、存储和消息编排。
+## 开发验证
+
+```powershell
+npm test
+npm run check
+```
