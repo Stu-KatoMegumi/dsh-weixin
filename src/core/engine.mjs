@@ -129,14 +129,40 @@ export class StreamRelay {
     else this.#arm()
   }
 
-  /** 主规则：三个连续换行（两个空行）即切出一个气泡。单/双换行只是段落排版，不会触发切分。 */
+  /**
+   * 主规则：模型输出显式标记 `>>>` 即切出一个气泡；同时兼容旧的三个连续换行。
+   * 单/双换行只是段落排版，不会触发切分。标记本身不会出现在微信文案里。
+   * 反引号包裹里的 `>>>`（例如代码示例 `` `>>>` ``）只是普通文本，不会被当作切分信号；
+   * 判断方法：`>>>` 前面还没有闭合的成对反引号时，视为普通文本，不切分。
+   */
   #splitOnBubbleBreak() {
-    let index
-    while ((index = this.buffer.indexOf('\n\n\n')) >= 0) {
+    const markers = ['>>>', '\n\n\n']
+    while (true) {
+      let index = -1
+      let len = 0
+      for (const marker of markers) {
+        const at = marker === '>>>'
+          ? this.#findBareMarker(this.buffer, '>>>')
+          : this.buffer.indexOf(marker)
+        if (at >= 0 && (index < 0 || at < index)) { index = at; len = marker.length }
+      }
+      if (index < 0) break
       const part = this.buffer.slice(0, index)
-      this.buffer = this.buffer.slice(index + 3)
+      this.buffer = this.buffer.slice(index + len)
       this.#sendPart(part)
     }
+  }
+
+  /** 找第一个「不在成对反引号内」的 `>>>`；找不到返回 -1。 */
+  #findBareMarker(text, marker) {
+    let i = 0
+    while ((i = text.indexOf(marker, i)) >= 0) {
+      const before = text.slice(0, i)
+      const backticks = (before.match(/`/g) || []).length
+      if (backticks % 2 === 0) return i
+      i += marker.length
+    }
+    return -1
   }
 
   flush(force) {
