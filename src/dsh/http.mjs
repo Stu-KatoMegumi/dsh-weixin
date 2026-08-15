@@ -168,6 +168,13 @@ export class HttpTransport extends BaseTransport {
     })
   }
 
+  /** Reuse an existing DSH session when the stable id collides across cdw. */
+  async #reuseExistingSession(sessionId) {
+    const listing = await this.call('session.list', {})
+    const found = (listing?.items || []).find(item => item?.sessionId === sessionId)
+    return found ? { sessionId: found.sessionId } : null
+  }
+
   async _ensureSession(userKey, { fresh = false, sessionId: requestedId } = {}) {
     const sessionId = requestedId || sessionIdFor(userKey, fresh ? crypto.randomUUID() : '')
     let workspace
@@ -188,9 +195,20 @@ export class HttpTransport extends BaseTransport {
     } catch (error) {
       if (error?.code && error.code !== 'internal') throw error
     }
-    return this.call('session.create', workspace?.workspaceId
-      ? { workspaceId: workspace.workspaceId, sessionId, agentPreset: this.preset }
-      : { cwd: this.sessionCwd, sessionId, agentPreset: this.preset })
+    try {
+      return await this.call('session.create', workspace?.workspaceId
+        ? { workspaceId: workspace.workspaceId, sessionId, agentPreset: this.preset }
+        : { cwd: this.sessionCwd, sessionId, agentPreset: this.preset })
+    } catch (error) {
+      // DSH rejects a preallocated id that already exists under a different cwd
+      // (session-conflict). Reuse the existing session so the user's
+      // conversation survives launches where the process cwd differs.
+      if (error?.code === 'session-conflict') {
+        const existing = await this.#reuseExistingSession(sessionId)
+        if (existing) return existing
+      }
+      throw error
+    }
   }
 
   async _prompt(sessionId, text) {

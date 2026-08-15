@@ -51,6 +51,13 @@ export class InprocTransport extends BaseTransport {
     this.streamTask = null
   }
 
+  /** Reuse an existing DSH session when the stable id collides across cdw. */
+  async #reuseExistingSession(sessionId) {
+    const listing = await this.call('sessions', 'list', {})
+    const found = (listing?.items || []).find(item => item?.sessionId === sessionId)
+    return found ? { sessionId: found.sessionId } : null
+  }
+
   async _ensureSession(userKey, { fresh = false, sessionId: requestedId } = {}) {
     const sessionId = requestedId || sessionIdFor(userKey, fresh ? crypto.randomUUID() : '')
     let workspace
@@ -85,9 +92,16 @@ export class InprocTransport extends BaseTransport {
     try {
       return await this.call('sessions', 'create', payload)
     } catch (error) {
-      // create is idempotent for a stable sessionId; if a profile reports an
-      // existing-session conflict, preserve the useful identity for callers.
-      if (error?.code === 'session-conflict') throw error
+      // create is idempotent for a stable sessionId and the same cwd, but DSH
+      // rejects a preallocated id that already exists under a different cwd
+      // (session-conflict). This happens when the bot's process cwd differs
+      // between launches (e.g. standalone from the checkout vs. loaded by DSH).
+      // Reuse the existing session instead of failing the turn, so the user's
+      // conversation and its history survive the cwd change.
+      if (error?.code === 'session-conflict') {
+        const existing = await this.#reuseExistingSession(sessionId)
+        if (existing) return existing
+      }
       throw error
     }
   }

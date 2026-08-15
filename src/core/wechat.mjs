@@ -269,7 +269,7 @@ export class WeChatClient {
   }
 
   /** Start a parallel QR renewal while the old token remains usable. */
-  async beginRenewal(recipient, { notify = true } = {}) {
+  async beginRenewal(recipient, { notify = true, open = true } = {}) {
     if (this.renewal) return this.renewal.url
     const qr = await this.#newQrCode()
     this.#persistQr(qr.url)
@@ -288,7 +288,11 @@ export class WeChatClient {
       await this.sendText(recipient, token, `🔐 微信登录凭据即将到期，请打开下面链接扫码续期：\n${qr.url}`).catch(error => {
         console.warn('[wechat] 续期提醒发送失败:', error.message)
       })
-    } else if (!recipient) {
+    } else if (!recipient && open) {
+      // Only the caller that owns the window should open the QR URL. The
+      // settings page hands the URL back to the browser page which opens it
+      // itself (open:false), while auto-renewal with no recipient opens the
+      // default browser once on the machine running the bot (open:true).
       openUrl(qr.url)
     }
     return qr.url
