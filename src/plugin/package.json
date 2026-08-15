@@ -1,14 +1,14 @@
 {
   "name": "@deepseek-ai/dsh-weixin",
-  "version": "1.0.0",
-  "description": "微信（ClawBot/iLink 官方通道）机器人插件：微信消息透传 DSH 会话并回复，双方对话落盘本地 session 目录",
+  "version": "1.0.1",
+  "description": "微信通道的 DSH 插件实现",
   "type": "module",
-  "main": "./src/plugin/index.mjs",
+  "main": "./index.mjs",
   "exports": {
-    ".": "./src/plugin/index.mjs"
+    ".": "./index.mjs"
   },
   "dependencies": {
-    "@deepseek-ai/schemastery": "workspace:^"
+    "@deepseek-ai/schemastery": "^3.18.1"
   },
   "engines": {
     "node": ">=22"

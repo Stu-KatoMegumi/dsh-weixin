@@ -1,0 +1,6 @@
+- insert:
+    - id: dsh-weixin
+      name: '@deepseek-ai/dsh-weixin'
+      config:
+        preset: weixin
+        workspaceTitle: 微信会话

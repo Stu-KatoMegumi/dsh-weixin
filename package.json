@@ -1,15 +1,33 @@
 {
-  "name": "dsh-weixin",
-  "version": "1.0.0",
-  "private": true,
+  "name": "@deepseek-ai/dsh-weixin",
+  "version": "1.0.1",
   "type": "module",
-  "description": "微信（ClawBot/iLink 官方通道）↔ DSH 机器人：双模式（npm start 独立运行 / npm run install 安装为 DSH 插件），双方对话落盘本地 session 目录",
+  "description": "微信 ClawBot/iLink 通道与 DSH 的官方 bundle 插件",
+  "main": "./src/plugin/index.mjs",
+  "exports": {
+    ".": "./src/plugin/index.mjs"
+  },
+  "files": [
+    "src",
+    "cordis.patch.yml",
+    "version.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "^3.18.1"
+  },
   "engines": {
     "node": ">=22"
   },
   "scripts": {
     "start": "node src/standalone/main.mjs",
-    "install": "node install.mjs",
-    "uninstall": "node install.mjs --uninstall"
+    "install:dsh": "node install.mjs",
+    "uninstall:dsh": "node install.mjs --uninstall"
   }
 }

@@ -33,19 +33,20 @@ export const name = 'dsh-weixin'
 export const inject = ['apiProxy']
 
 export const Config = z.object({
-  sessionDir: z.string(),
-  sessionCwd: z.string(),
-  workspaceTitle: z.string(),
-  preset: z.string(),
-  slowAckMs: z.number(),
-  turnTimeoutMs: z.number(),
-  chunkSize: z.number(),
-  pollTimeoutMs: z.number(),
+  sessionDir: z.string().default(''),
+  sessionCwd: z.string().default(''),
+  workspaceTitle: z.string().default('微信会话'),
+  preset: z.string().default('weixin'),
+  slowAckMs: z.number().default(4000),
+  turnTimeoutMs: z.number().default(15 * 60 * 1000),
+  chunkSize: z.number().default(1800),
+  pollTimeoutMs: z.number().default(5000),
 })
 
 export function apply(ctx, config = {}) {
   const preset = config.preset || process.env.WX_BOT_PRESET || 'weixin'
-  const sessionCwd = path.resolve(config.sessionCwd || process.env.WX_BOT_CWD || process.cwd())
+  const projectDir = path.resolve(__dirname, '../..')
+  const sessionCwd = path.resolve(config.sessionCwd || process.env.WX_BOT_CWD || projectDir)
   const sessionDir = path.resolve(
     config.sessionDir || process.env.WX_BOT_SESSION_DIR || path.join(sessionCwd, 'session'),
   )

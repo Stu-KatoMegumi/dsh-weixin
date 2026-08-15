@@ -58,12 +58,13 @@ export class Store {
   }
 
   /** 记录/刷新用户与会话的映射 */
-  touchUser(userKey, sessionId) {
+  touchUser(userKey, sessionId, contextToken) {
     const users = this.loadUsers()
     users[userKey] = {
       sessionId,
       createdAt: users[userKey]?.createdAt ?? new Date().toISOString(),
       lastActiveAt: new Date().toISOString(),
+      ...(contextToken ? { lastContextToken: contextToken } : {}),
     }
     atomicWrite(this.usersFile, JSON.stringify(users, null, 2) + '\n')
     return users[userKey]
