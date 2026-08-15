@@ -67,8 +67,8 @@ export function normalizeConfig(config = {}) {
     slowAckMs: Number(config.slowAckMs ?? 4000),
     turnTimeoutMs: Number(config.turnTimeoutMs ?? 15 * 60 * 1000),
     // streamFlushChars = 单气泡长度上限；streamFlushMs = 空闲超时（无新内容自动发）
-    streamFlushChars: Math.max(200, Number(config.streamFlushChars ?? 2000)),
-    streamFlushMs: Math.max(500, Number(config.streamFlushMs ?? 8000)),
+    streamFlushChars: Math.max(200, Number(config.streamFlushChars ?? 800)),
+    streamFlushMs: Math.max(500, Number(config.streamFlushMs ?? 30000)),
     maintenanceIntervalMs: Math.max(10_000, Number(config.maintenanceIntervalMs ?? 60_000)),
     complexAckText: String(config.complexAckText || '好的，我先思考一下，稍后给你结果。'),
     fastModel: config.fastModel ?? null,
@@ -130,19 +130,18 @@ export class StreamRelay {
   }
 
   /**
-   * 主规则：模型输出显式标记 `>>>` 即切出一个气泡；同时兼容旧的三个连续换行。
-   * 单/双换行只是段落排版，不会触发切分。标记本身不会出现在微信文案里。
-   * 反引号包裹里的 `>>>`（例如代码示例 `` `>>>` ``）只是普通文本，不会被当作切分信号；
-   * 判断方法：`>>>` 前面还没有闭合的成对反引号时，视为普通文本，不切分。
+   * 主规则：模型输出单独占一行的 `---`（前后各一个换行）即切出一个气泡；同时兼容旧的三个连续换行。
+   * 单/双换行只是段落排版，不会触发切分。分隔符本身不会出现在微信文案里。
+   * 反引号包裹里的 `---`（例如代码示例）只是普通文本，不会被当作切分信号。
    */
   #splitOnBubbleBreak() {
-    const markers = ['>>>', '\n\n\n']
+    const markers = ['\n---\n', '\n\n\n']
     while (true) {
       let index = -1
       let len = 0
       for (const marker of markers) {
-        const at = marker === '>>>'
-          ? this.#findBareMarker(this.buffer, '>>>')
+        const at = marker === '\n---\n'
+          ? this.#findBareMarker(this.buffer, '\n---\n')
           : this.buffer.indexOf(marker)
         if (at >= 0 && (index < 0 || at < index)) { index = at; len = marker.length }
       }
@@ -153,7 +152,7 @@ export class StreamRelay {
     }
   }
 
-  /** 找第一个「不在成对反引号内」的 `>>>`；找不到返回 -1。 */
+  /** 找第一个「不在成对反引号内」的 marker；找不到返回 -1。 */
   #findBareMarker(text, marker) {
     let i = 0
     while ((i = text.indexOf(marker, i)) >= 0) {
@@ -243,6 +242,7 @@ export class Engine {
     this.defaultPromptDir = defaultPromptDir || path.join(process.cwd(), 'src', 'prompt')
     ensurePromptFiles(this.defaultPromptDir, this.promptDir)
     this.userBySession = new Map()
+    this.activeTurns = new Map()
     this.started = false
     this.maintenanceTimer = null
     this.jobRuns = new Map()
@@ -370,6 +370,12 @@ export class Engine {
       return
     }
 
+    // 打断：新消息取消上一轮仍在进行的 turn，并用版本号让旧轮静默退出，不再发送回复。
+    const prev = this.activeTurns.get(userKey)
+    if (prev) await this.transport.cancel(prev.sessionId).catch(() => {})
+    const gen = (prev?.gen ?? 0) + 1
+    this.activeTurns.set(userKey, { sessionId, gen })
+
     this.store.appendHistory(userKey, 'user', text)
     const complex = text.length > 40 || ACTION_RE.test(text)
     if (complex && !this.config.streaming) await this.wechat.sendText(userKey, contextToken, this.config.complexAckText)
@@ -390,9 +396,14 @@ export class Engine {
         slowMs: complex ? 0 : this.config.slowAckMs,
         onDelta: delta => relay.push(delta),
       })
+      if (this.activeTurns.get(userKey)?.gen !== gen) return
       this.store.appendHistory(userKey, 'assistant', reply || '')
       await relay.finish(reply)
+    } catch (error) {
+      // 被打断（版本号已变化）时静默；否则抛给上层按真实错误处理。
+      if (this.activeTurns.get(userKey)?.gen === gen) throw error
     } finally {
+      if (this.activeTurns.get(userKey)?.gen === gen) this.activeTurns.delete(userKey)
       if (this.config.typing) await this.wechat.setTyping(userKey, contextToken, false)
     }
   }

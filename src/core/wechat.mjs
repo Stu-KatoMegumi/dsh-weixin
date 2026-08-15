@@ -97,6 +97,7 @@ export class WeChatClient {
     stateFile,
     mediaDir = path.join(path.dirname(stateFile), 'media'),
     chunkSize = 2000,
+    sendIntervalMs = 200,
     pollTimeoutMs = 8000,
     watchdogMs = 90_000,
     renewAfterMs = DEFAULT_RENEW_AFTER_MS,
@@ -109,6 +110,7 @@ export class WeChatClient {
     this.stateFile = stateFile
     this.mediaDir = mediaDir
     this.chunkSize = Math.max(200, chunkSize)
+    this.sendIntervalMs = Math.max(0, Number(sendIntervalMs) || 0)
     this.pollTimeoutMs = pollTimeoutMs
     this.watchdogMs = watchdogMs
     this.renewAfterMs = renewAfterMs
@@ -130,6 +132,7 @@ export class WeChatClient {
     this.lastPollAt = 0
     this.lastSuccessAt = 0
     this.lastError = null
+    this.lastSendAt = 0
   }
 
   #loadState() {
@@ -378,7 +381,7 @@ export class WeChatClient {
   }
 
   async sendItems(to, contextToken, itemList) {
-    const value = await this.#ilink('/ilink/bot/sendmessage', {
+    const body = {
       msg: {
         from_user_id: '',
         to_user_id: to,
@@ -388,8 +391,21 @@ export class WeChatClient {
         context_token: contextToken || undefined,
         item_list: itemList,
       },
-    })
-    return value
+    }
+    // 节流：控制两次 sendmessage 的最小间隔，降低微信 iLink 限流（prepare failed）概率。
+    const wait = this.lastSendAt + this.sendIntervalMs - Date.now()
+    if (wait > 0) await sleep(wait)
+    this.lastSendAt = Date.now()
+    let attempt = 0
+    for (;;) {
+      try {
+        return await this.#ilink('/ilink/bot/sendmessage', body)
+      } catch (error) {
+        // 登录过期不重试；其余错误退避重试，最多 3 次，避免偶发限流丢失整条气泡。
+        if (error instanceof SessionExpiredError || ++attempt >= 3) throw error
+        await sleep(250 * attempt)
+      }
+    }
   }
 
   async sendText(to, contextToken, text, { format = true } = {}) {

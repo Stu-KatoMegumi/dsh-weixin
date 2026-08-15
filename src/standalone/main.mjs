@@ -37,8 +37,8 @@ const config = {
   admins: list(process.env.WX_BOT_ADMINS),
   slowAckMs: Number(process.env.WX_BOT_SLOW_ACK_MS || 4000),
   turnTimeoutMs: Number(process.env.WX_BOT_TURN_TIMEOUT_MS || 15 * 60 * 1000),
-  streamFlushChars: Number(process.env.WX_BOT_STREAM_FLUSH_CHARS || 2000),
-  streamFlushMs: Number(process.env.WX_BOT_STREAM_FLUSH_MS || 8000),
+  streamFlushChars: Number(process.env.WX_BOT_STREAM_FLUSH_CHARS || 800),
+  streamFlushMs: Number(process.env.WX_BOT_STREAM_FLUSH_MS || 30000),
   outboxDir: path.resolve(process.env.WX_BOT_OUTBOX_DIR || path.join(sessionCwd, 'outbox')),
   ...modelConfig(),
 }
@@ -69,6 +69,7 @@ if (dshReady) {
     stateFile: store.botFile,
     mediaDir: path.join(sessionDir, 'media'),
     chunkSize: Number(process.env.WX_BOT_CHUNK_SIZE || 2000),
+    sendIntervalMs: Number(process.env.WX_BOT_SEND_INTERVAL_MS || 200),
     pollTimeoutMs: Number(process.env.WX_BOT_POLL_TIMEOUT_MS || 8000),
     watchdogMs: Number(process.env.WX_BOT_WATCHDOG_MS || 90_000),
     version,

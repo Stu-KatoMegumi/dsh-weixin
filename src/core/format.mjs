@@ -25,20 +25,17 @@ export function formatForWeChat(input) {
 export function safeTextCut(text, maximum, lookahead = 80) {
   if (text.length <= maximum) return text.length
   const floor = Math.max(1, Math.floor(maximum * 0.55))
-  // 强边界：换行 / 句末标点。先在 [floor, maximum] 内找最后一个；
-  // 没有就继续向前看到下一个句子结束点（允许略超上限，保住完整句子）。
-  const sentenceEnd = /[\n。！？!?；;…]/
-  const inWindow = text.slice(floor, maximum + 1)
+  // 任意标点/换行都可作为截断点：先在 [floor, maximum) 内找最后一个（截断点不超过上限），
+  // 没有才向前看到下一个标点（允许略超上限，保住完整句子）。
+  const boundary = /[\n。！？!?；;…，,、：:\u3000 ]/
+  const inWindow = text.slice(floor, maximum)
   for (let index = inWindow.length - 1; index >= 0; index--) {
-    if (sentenceEnd.test(inWindow[index])) return floor + index + 1
+    if (boundary.test(inWindow[index])) return floor + index + 1
   }
   const ahead = text.slice(maximum, Math.min(text.length, maximum + lookahead))
   for (let index = 0; index < ahead.length; index++) {
-    if (sentenceEnd.test(ahead[index])) return maximum + index + 1
+    if (boundary.test(ahead[index])) return maximum + index + 1
   }
-  // 弱边界：中文逗号/顿号/空格/英文逗号，尽量不切但在没有任何句边界时兜底。
-  const weak = /[，,、\u3000 ](?=[^，,、\u3000  ]*$)/.exec(text.slice(floor))
-  if (weak) return floor + weak.index + 1
   return maximum
 }
 
