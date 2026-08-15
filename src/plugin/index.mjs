@@ -1,0 +1,64 @@
+// src/plugin/index.mjs — DSH 插件入口（host 平面）
+//
+// 安装后由 $DSH_HOME/cordis.patch.yml 的 weixin-bot 行挂载，随 `pnpm dsh web`
+// 一起加载。与独立模式共用同一套核心，只是 DSH 传输层换成进程内 apiProxy
+// （不经 HTTP/WebSocket，事件直接消费 apiProxy.events.mux() 的异步迭代器）。
+//
+// 插件配置（cordis.patch.yml 里 weixin-bot 行的 config）：
+//   sessionDir     本地 session 目录（建议指向项目文件夹，双方对话落盘处）
+//   sessionCwd     微信会话的工作目录（也是「微信会话」分组的目录）
+//   workspaceTitle 分组显示名，默认「微信会话」
+//   preset         agent preset，默认 weixin
+//   slowAckMs / turnTimeoutMs / chunkSize / pollTimeoutMs 见 README
+
+import path from 'node:path'
+import z from '@deepseek-ai/schemastery'
+import { WeChatClient } from '../core/wechat.mjs'
+import { Store } from '../core/store.mjs'
+import { Engine } from '../core/engine.mjs'
+import { InprocTransport } from '../dsh/inproc.mjs'
+
+export const name = 'weixin-bot'
+export const inject = ['apiProxy']
+
+export const Config = z.object({
+  sessionDir: z.string().optional(),
+  sessionCwd: z.string().optional(),
+  workspaceTitle: z.string().optional(),
+  preset: z.string().optional(),
+  slowAckMs: z.number().optional(),
+  turnTimeoutMs: z.number().optional(),
+  chunkSize: z.number().optional(),
+  pollTimeoutMs: z.number().optional(),
+})
+
+export function apply(ctx, config = {}) {
+  const preset = config.preset || process.env.WX_BOT_PRESET || 'weixin'
+  const sessionCwd = path.resolve(config.sessionCwd || process.env.WX_BOT_CWD || process.cwd())
+  const sessionDir = path.resolve(
+    config.sessionDir || process.env.WX_BOT_SESSION_DIR || path.join(sessionCwd, 'session'),
+  )
+  const workspaceTitle = config.workspaceTitle || '微信会话'
+  const engineConfig = {
+    slowAckMs: config.slowAckMs ?? Number(process.env.WX_BOT_SLOW_ACK_MS || 4000),
+    turnTimeoutMs: config.turnTimeoutMs ?? Number(process.env.WX_BOT_TURN_TIMEOUT_MS || 15 * 60 * 1000),
+    chunkSize: config.chunkSize ?? Number(process.env.WX_BOT_CHUNK_SIZE || 1800),
+    pollTimeoutMs: config.pollTimeoutMs ?? Number(process.env.WX_BOT_POLL_TIMEOUT_MS || 5000),
+  }
+
+  console.log(`[weixin-bot] 插件启动: preset=${preset} sessionDir=${sessionDir} 分组=${workspaceTitle}`)
+
+  const wechat = new WeChatClient({
+    stateFile: path.join(sessionDir, 'bot.json'),
+    chunkSize: engineConfig.chunkSize,
+    pollTimeoutMs: engineConfig.pollTimeoutMs,
+  })
+  const store = new Store(sessionDir)
+  const transport = new InprocTransport(ctx.apiProxy, { preset, sessionCwd, workspaceTitle })
+  const engine = new Engine({ wechat, store, transport, config: engineConfig })
+
+  ctx.effect(() => {
+    engine.start()
+    return () => engine.stop()
+  })
+}

@@ -1,13 +1,14 @@
 {
   "name": "weixin-bot",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "ClawBot（微信官方 iLink 通道）↔ DSH 桥：微信联系人消息透传到 DeepSeek Harness 会话并回复",
+  "description": "微信（ClawBot/iLink 官方通道）↔ DSH 机器人：双模式（npm start 独立运行 / npm run install 安装为 DSH 插件），双方对话落盘本地 session 目录",
   "engines": {
     "node": ">=22"
   },
   "scripts": {
-    "start": "node bridge.mjs"
+    "start": "node src/standalone/main.mjs",
+    "install": "node install.mjs"
   }
 }

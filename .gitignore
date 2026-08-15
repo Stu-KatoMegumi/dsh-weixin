@@ -1,3 +1,5 @@
 node_modules/
-state/
 dsh/
+session/
+state/
+*.tmp
