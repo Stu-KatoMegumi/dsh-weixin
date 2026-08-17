@@ -6,6 +6,8 @@ import { cronMatches, minuteKey } from './scheduler.mjs'
 import { PROMPT_FILES, ensurePromptFiles, renderPrompt, readPromptFile, writePromptFile, resetPromptFile, editablePromptDir } from './prompt.mjs'
 
 const ACTION_RE = /(写|改|创建|生成|删除|移动|复制|运行|执行|启动|停止|安装|下载|上传|搜索|查询|查找|分析|总结|整理|重构|调试|测试|构建|打包|部署|提交|推送|合并|克隆|备份|翻译|转换|解压|代码|脚本|命令|文件|项目|docker|git|npm|pnpm|node|python|pip|ssh|sql|api)/i
+const FLASH_PROVIDER = 'deepseek-official'
+const FLASH_MODEL = 'deepseek-v4-flash'
 
 function stringList(value) {
   if (Array.isArray(value)) return value.map(String).map(item => item.trim()).filter(Boolean)
@@ -63,7 +65,6 @@ export function normalizeConfig(config = {}) {
     renewalEnabled: bool(config.renewalEnabled, true),
     accessPolicy: ['pairing', 'allowlist', 'disabled'].includes(config.accessPolicy) ? config.accessPolicy : 'pairing',
     allowlist: stringList(config.allowlist),
-    admins: stringList(config.admins),
     slowAckMs: Number(config.slowAckMs ?? 4000),
     turnTimeoutMs: Number(config.turnTimeoutMs ?? 15 * 60 * 1000),
     // streamFlushChars = 单气泡长度上限；streamFlushMs = 空闲超时（无新内容自动发）
@@ -71,28 +72,38 @@ export function normalizeConfig(config = {}) {
     streamFlushMs: Math.max(500, Number(config.streamFlushMs ?? 30000)),
     maintenanceIntervalMs: Math.max(10_000, Number(config.maintenanceIntervalMs ?? 60_000)),
     complexAckText: String(config.complexAckText || '好的，我先思考一下，稍后给你结果。'),
-    fastModel: config.fastModel ?? null,
-    complexModel: config.complexModel ?? null,
+    // 模型策略固定为 flash；只按任务强度切换关闭思考和最高思考挡位。
+    // 不读取旧的 fastModel/complexModel，避免持久化配置或入口配置绕过策略。
+    fastModel: flashModel('off'),
+    complexModel: flashModel('max'),
     outboxDir: path.resolve(config.outboxDir || path.join(config.sessionCwd || process.cwd(), 'outbox')),
     jobs: Array.isArray(config.jobs) ? config.jobs : [],
   }
 }
 
-export function modelConfig(env = process.env) {
-  const spec = (model, reasoning) => {
-    if (!model) return null
-    const slash = model.indexOf('/')
-    return {
-      provider: slash > 0 ? model.slice(0, slash) : 'deepseek-official',
-      model: slash > 0 ? model.slice(slash + 1) : model,
-      reasoningEffort: reasoning ? String(reasoning).toLowerCase() : undefined,
-    }
-  }
+function flashModel(reasoningEffort) {
   return {
-    fastModel: spec(env.WX_BOT_FAST_MODEL || 'deepseek-official/deepseek-v4-flash', env.WX_BOT_FAST_REASONING || 'off'),
-    complexModel: spec(env.WX_BOT_COMPLEX_MODEL || 'deepseek-official/deepseek-v4-pro', env.WX_BOT_COMPLEX_REASONING || 'high'),
-    complexAckText: env.WX_BOT_COMPLEX_ACK_TEXT || '好的，我先思考一下，稍后给你结果。',
+    provider: FLASH_PROVIDER,
+    model: FLASH_MODEL,
+    reasoningEffort,
   }
+}
+
+export function modelConfig(_env = process.env) {
+  return {
+    fastModel: flashModel('off'),
+    complexModel: flashModel('max'),
+    complexAckText: _env.WX_BOT_COMPLEX_ACK_TEXT || '好的，我先思考一下，稍后给你结果。',
+  }
+}
+
+export function renewalRecipients(users, { accessPolicy = 'pairing', allowlist = [] } = {}) {
+  if (accessPolicy === 'disabled') return []
+  const allowed = new Set(allowlist || [])
+  return Object.entries(users || {})
+    .filter(([userId, record]) => Boolean(record?.lastContextToken)
+      && (accessPolicy !== 'allowlist' || allowed.has(userId)))
+    .map(([userId]) => userId)
 }
 
 /**
@@ -287,7 +298,7 @@ export class Engine {
   updateSettings(patch) {
     const allowed = [
       'enabled', 'streaming', 'typing', 'mediaEnabled', 'renewalEnabled', 'accessPolicy',
-      'allowlist', 'admins', 'slowAckMs', 'turnTimeoutMs', 'streamFlushChars', 'streamFlushMs',
+      'allowlist', 'slowAckMs', 'turnTimeoutMs', 'streamFlushChars', 'streamFlushMs',
       'complexAckText', 'outboxDir', 'jobs',
     ]
     const clean = Object.fromEntries(Object.entries(patch || {}).filter(([key]) => allowed.includes(key)))
@@ -310,7 +321,7 @@ export class Engine {
     if (msg?.message_type !== 1 || msg?.group_id || !msg?.from_user_id) return
     const userKey = String(msg.from_user_id)
     const contextToken = msg.context_token || ''
-    this.wechat.rememberContext(userKey, contextToken)
+    await this.wechat.rememberContext(userKey, contextToken)
     if (!this.#allowed(userKey)) {
       if (this.config.accessPolicy !== 'disabled') {
         await this.wechat.sendText(userKey, contextToken, '该微信账号尚未获得 dsh-weixin 访问权限。')
@@ -379,7 +390,12 @@ export class Engine {
     this.store.appendHistory(userKey, 'user', text)
     const complex = text.length > 40 || ACTION_RE.test(text)
     if (complex && !this.config.streaming) await this.wechat.sendText(userKey, contextToken, this.config.complexAckText)
-    await this.#selectModel(sessionId, complex ? this.config.complexModel : this.config.fastModel)
+    try {
+      await this.#selectModel(sessionId, complex ? this.config.complexModel : this.config.fastModel)
+    } catch (error) {
+      if (this.activeTurns.get(userKey)?.gen === gen) this.activeTurns.delete(userKey)
+      throw error
+    }
     if (this.config.typing) await this.wechat.setTyping(userKey, contextToken, true)
     const relay = new StreamRelay({
       wechat: this.wechat,
@@ -445,13 +461,12 @@ export class Engine {
 
   async #command(userKey, token, sessionId, input) {
     const [command, ...args] = input.trim().split(/\s+/)
-    const admin = this.config.admins.includes(userKey)
-    if (command === '/help') {
+    if (command === '/help' || command === '/?') {
       await this.wechat.sendText(userKey, token, [
         '🤖 dsh-weixin 命令',
         '/new - 开始新会话', '/stop - 停止当前任务', '/status - 查看连接状态',
-        '/send <outbox内相对路径> - 发送文件', '/renew - 扫码续期',
-        ...(admin ? ['/users - 列出已知用户', '/allow add|remove <ID> - 管理白名单', '/cron - 列出定时任务'] : []),
+        '/send <outbox内相对路径> - 发送文件', '/renew - 发送续签二维码',
+        '/users - 列出已知用户', '/allow add|remove <ID> - 管理白名单', '/cron - 列出定时任务',
       ].join('\n'))
       return
     }
@@ -475,8 +490,7 @@ export class Engine {
       return
     }
     if (command === '/renew') {
-      const url = await this.wechat.beginRenewal(userKey, { notify: false })
-      await this.wechat.sendText(userKey, token, `续期二维码链接：\n${url}`)
+      await this.wechat.beginRenewal(userKey, { notify: true, open: false })
       return
     }
     if (command === '/send') {
@@ -488,17 +502,17 @@ export class Engine {
       await this.wechat.sendFile(userKey, token, candidate)
       return
     }
-    if (command === '/users' && admin) {
+    if (command === '/users') {
       await this.wechat.sendText(userKey, token, Object.entries(this.store.loadUsers())
         .map(([id, value]) => `${id}  ${value.lastActiveAt || ''}`).join('\n') || '暂无用户')
       return
     }
-    if (command === '/cron' && admin) {
+    if (command === '/cron') {
       const lines = this.config.jobs.map(job => `${job.enabled === false ? '⏸' : '▶'} ${job.id || '-'}  ${job.cron || '-'}  ${job.userId || '-'}`)
       await this.wechat.sendText(userKey, token, lines.join('\n') || '暂无定时任务')
       return
     }
-    if (command === '/allow' && admin) {
+    if (command === '/allow') {
       const [operation, target] = args
       if (!['add', 'remove'].includes(operation) || !target) throw new Error('用法：/allow add|remove <用户ID>')
       const allowlist = new Set(this.config.allowlist)
@@ -513,14 +527,22 @@ export class Engine {
 
   #allowed(userKey) {
     if (!this.config.enabled || this.config.accessPolicy === 'disabled') return false
-    if (this.config.admins.includes(userKey)) return true
     return this.config.accessPolicy !== 'allowlist' || this.config.allowlist.includes(userKey)
   }
 
   async #selectModel(sessionId, spec) {
     if (!spec) return
-    try { await this.transport.selectModel(sessionId, spec) } catch (error) {
-      this.logger.warn(`[engine] 模型切换失败，继续使用当前模型：${error.message}`)
+    try {
+      const selected = await this.transport.selectModel(sessionId, spec)
+      if (!selected
+        || selected.provider !== spec.provider
+        || selected.model !== spec.model
+        || selected.reasoningEffort !== spec.reasoningEffort) {
+        throw new Error('DSH 未确认固定的 flash 模型和推理挡位')
+      }
+    } catch (error) {
+      this.logger.warn(`[engine] 模型切换失败，本轮已停止：${error.message}`)
+      throw error
     }
   }
 
@@ -549,9 +571,9 @@ export class Engine {
   async #maintenance() {
     if (!this.started) return
     try {
-      const users = Object.entries(this.store.loadUsers()).sort((a, b) => String(b[1].lastActiveAt).localeCompare(String(a[1].lastActiveAt)))
-      const recipient = this.config.admins.find(id => this.store.getUser(id)?.lastContextToken) || users[0]?.[0]
-      if (this.config.renewalEnabled) await this.wechat.checkRenewal(recipient)
+      const users = this.store.loadUsers()
+      const recipients = renewalRecipients(users, this.config)
+      if (this.config.renewalEnabled) await this.wechat.checkRenewal(recipients)
       const now = new Date()
       const key = minuteKey(now)
       for (const job of this.config.jobs) {

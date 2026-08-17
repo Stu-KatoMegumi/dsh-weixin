@@ -35,7 +35,6 @@ export const Config = z.object({
   preset: z.string().default('standard'),
   accessPolicy: z.union(['pairing', 'allowlist', 'disabled']).default('pairing'),
   allowlist: z.array(z.string()).default([]),
-  admins: z.array(z.string()).default([]),
   streaming: z.boolean().default(true),
   typing: z.boolean().default(true),
   mediaEnabled: z.boolean().default(true),

@@ -62,7 +62,10 @@ export function registerControlApi(webServer, engine, wechat) {
         // open (default) so the server opens a dedicated scan app-window that
         // it can close automatically once the login/renewal scan succeeds. The
         // settings page must not open a second window of its own.
-        else if (method === 'login.start') value = { url: await wechat.beginRenewal(null) }
+        else if (method === 'login.start') {
+          await wechat.beginRenewal(null, { notify: false, open: true })
+          value = { started: true, pending: true }
+        }
         else if (method === 'errors') value = engine.store.readErrors(Math.min(100, Number(body?.limit || 20)))
         else if (method === 'prompt.list') value = engine.listPrompts()
         else if (method === 'prompt.save') value = engine.savePrompt(body?.name, body?.content)

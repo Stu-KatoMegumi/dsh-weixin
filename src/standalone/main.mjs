@@ -34,7 +34,6 @@ const config = {
   renewalEnabled: flag(process.env.WX_BOT_RENEWAL),
   accessPolicy: process.env.WX_BOT_ACCESS_POLICY || 'pairing',
   allowlist: list(process.env.WX_BOT_ALLOWLIST),
-  admins: list(process.env.WX_BOT_ADMINS),
   slowAckMs: Number(process.env.WX_BOT_SLOW_ACK_MS || 4000),
   turnTimeoutMs: Number(process.env.WX_BOT_TURN_TIMEOUT_MS || 15 * 60 * 1000),
   streamFlushChars: Number(process.env.WX_BOT_STREAM_FLUSH_CHARS || 800),

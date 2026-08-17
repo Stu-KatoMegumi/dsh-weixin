@@ -2,7 +2,8 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
-import { downloadInboundItem, uploadOutboundFile } from './media.mjs'
+import QRCode from 'qrcode'
+import { downloadInboundItem, uploadOutboundBuffer, uploadOutboundFile } from './media.mjs'
 import { formatForWeChat, safeTextCut } from './format.mjs'
 
 const ILINK_DEFAULT = 'https://ilinkai.weixin.qq.com'
@@ -10,7 +11,83 @@ const ILINK_APP_ID = 'bot'
 const BOT_AGENT = 'dsh-weixin'
 const DEFAULT_RENEW_AFTER_MS = 24 * 60 * 60 * 1000
 const DEFAULT_RENEW_WARN_MS = 2 * 60 * 60 * 1000
+const RENEW_NOTICE_INTERVAL_MS = 10 * 60 * 1000
+const QR_CONTENT_MAX_CHARS = 4096
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
+
+function localTime(reference, hour, minute, dayOffset = 0) {
+  return new Date(
+    reference.getFullYear(),
+    reference.getMonth(),
+    reference.getDate() + dayOffset,
+    hour,
+    minute,
+    0,
+    0,
+  ).getTime()
+}
+
+function isRenewalWorkTime(timestamp) {
+  const date = new Date(timestamp)
+  const hour = date.getHours()
+  return (hour >= 8 && hour < 22) || (hour === 22 && date.getMinutes() === 0)
+}
+
+/** First reminder timestamp using the host machine's local calendar. */
+export function firstRenewalNoticeAt(expiresAt, leadMs = DEFAULT_RENEW_WARN_MS) {
+  const normal = new Date(Number(expiresAt) - leadMs)
+  if (!Number.isFinite(normal.getTime())) return 0
+  const minute = normal.getHours() * 60 + normal.getMinutes()
+  if (minute < 8 * 60) return localTime(normal, 21, 30, -1)
+  if (minute > 22 * 60) return localTime(normal, 21, 30)
+  return normal.getTime()
+}
+
+/** Decide whether an automatic reminder is due now. */
+export function renewalReminderDecision({
+  expiresAt,
+  now = Date.now(),
+  lastAttemptAt = 0,
+  emergencySentAt = 0,
+  intervalMs = RENEW_NOTICE_INTERVAL_MS,
+  leadMs = DEFAULT_RENEW_WARN_MS,
+} = {}) {
+  const expiry = Number(expiresAt)
+  const current = Number(now)
+  if (!Number.isFinite(expiry) || !Number.isFinite(current) || current >= expiry) return null
+  if (current < firstRenewalNoticeAt(expiry, leadMs)) return null
+  if (isRenewalWorkTime(current)) {
+    return !lastAttemptAt || current - Number(lastAttemptAt) >= intervalMs ? 'regular' : null
+  }
+  if (!lastAttemptAt && !emergencySentAt) return 'emergency'
+  return null
+}
+
+export async function renderQrPng(content) {
+  const value = String(content || '').trim()
+  if (!value) throw new Error('二维码内容为空')
+  if (value.length > QR_CONTENT_MAX_CHARS) throw new Error('二维码内容过长')
+  return QRCode.toBuffer(value, {
+    type: 'png',
+    width: 512,
+    margin: 4,
+    errorCorrectionLevel: 'H',
+    color: { dark: '#000000', light: '#ffffff' },
+  })
+}
+
+function formatLocalDateTime(timestamp) {
+  const value = new Date(timestamp)
+  const date = [value.getFullYear(), value.getMonth() + 1, value.getDate()]
+    .map((part, index) => String(part).padStart(index === 0 ? 4 : 2, '0')).join('-')
+  const time = [value.getHours(), value.getMinutes()].map(part => String(part).padStart(2, '0')).join(':')
+  return `${date} ${time}`
+}
+
+function recipientList(value) {
+  const values = Array.isArray(value) ? value : [value]
+  return [...new Set(values.map(item => String(item || '').trim()).filter(Boolean))]
+}
 
 export class SessionExpiredError extends Error {
   constructor(message = '微信登录凭据已过期') {
@@ -103,6 +180,9 @@ export class WeChatClient {
     renewAfterMs = DEFAULT_RENEW_AFTER_MS,
     renewWarnBeforeMs = DEFAULT_RENEW_WARN_MS,
     version = '1.0.0',
+    fetchImpl = globalThis.fetch,
+    qrEncoder = renderQrPng,
+    now = () => Date.now(),
     log = console.log,
     warn = console.warn,
     error = console.error,
@@ -116,6 +196,9 @@ export class WeChatClient {
     this.renewAfterMs = renewAfterMs
     this.renewWarnBeforeMs = renewWarnBeforeMs
     this.version = version
+    this.fetch = fetchImpl
+    this.qrEncoder = qrEncoder
+    this.now = now
     this.log = log
     this.warn = warn
     this.error = error
@@ -123,11 +206,15 @@ export class WeChatClient {
     this.state = this.#loadState()
     this.token = this.state.botToken || ''
     this.baseUrl = this.state.baseUrl || ILINK_DEFAULT
+    this.credentialEpoch = 0
     this.nextPollTimeoutMs = pollTimeoutMs
     this.stopped = false
     this.notified = false
     this.scanClose = null
     this.renewal = null
+    this.feedbackFlush = null
+    this.feedbackFlushTarget = null
+    this.feedbackDelivery = null
     this.typingTickets = new Map()
     this.lastPollAt = 0
     this.lastSuccessAt = 0
@@ -147,13 +234,17 @@ export class WeChatClient {
     return Buffer.from(String((Math.random() * 0xffffffff) >>> 0)).toString('base64')
   }
 
-  async #ilink(pathname, body, { timeoutMs } = {}) {
-    const response = await fetch(this.baseUrl + pathname, {
+  #authSnapshot() {
+    return { token: this.token, baseUrl: this.baseUrl, epoch: this.credentialEpoch }
+  }
+
+  async #ilink(pathname, body, { timeoutMs, auth = this.#authSnapshot() } = {}) {
+    const response = await this.fetch(auth.baseUrl + pathname, {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
         authorizationtype: 'ilink_bot_token',
-        authorization: `Bearer ${this.token}`,
+        authorization: `Bearer ${auth.token}`,
         'x-wechat-uin': this.#randomUin(),
         'iLink-App-Id': ILINK_APP_ID,
         'iLink-App-ClientVersion': String(this.clientVersion),
@@ -164,8 +255,13 @@ export class WeChatClient {
     const value = await response.json().catch(() => ({ ret: -1, message: `HTTP ${response.status}` }))
     const code = value?.errcode ?? value?.ret
     if (code === -14) {
-      this.invalidateCredentials()
-      throw new SessionExpiredError()
+      // A long poll started with the previous token may finish after renewal.
+      // Never let that stale response invalidate credentials accepted later.
+      const staleCredentials = auth.epoch !== this.credentialEpoch || auth.token !== this.token
+      if (!staleCredentials) this.invalidateCredentials()
+      const error = new SessionExpiredError()
+      error.staleCredentials = staleCredentials
+      throw error
     }
     if (!response.ok || (typeof value?.ret === 'number' && value.ret !== 0)) {
       const error = new Error(value?.errmsg || value?.message || `iLink HTTP ${response.status}`)
@@ -189,16 +285,20 @@ export class WeChatClient {
   }
 
   invalidateCredentials() {
+    this.credentialEpoch += 1
     this.token = ''
+    this.notified = false
     delete this.state.botToken
     delete this.state.loginAt
     delete this.state.updatesBuf
+    delete this.state.renewalNotice
     this.#saveState()
   }
 
-  async notifyStart() {
-    await this.#ilink('/ilink/bot/msg/notifystart', {})
-    this.notified = true
+  async notifyStart({ timeoutMs } = {}) {
+    const auth = this.#authSnapshot()
+    await this.#ilink('/ilink/bot/msg/notifystart', {}, { timeoutMs, auth })
+    if (auth.epoch === this.credentialEpoch) this.notified = true
   }
 
   async notifyStop() {
@@ -207,22 +307,30 @@ export class WeChatClient {
   }
 
   async #newQrCode() {
-    const response = await fetch(`${ILINK_DEFAULT}/ilink/bot/get_bot_qrcode?bot_type=3`, {
+    const response = await this.fetch(`${ILINK_DEFAULT}/ilink/bot/get_bot_qrcode?bot_type=3`, {
       signal: AbortSignal.timeout(20_000),
     })
     const qr = await response.json()
     if (!response.ok || qr.ret !== 0 || !qr.qrcode) throw new Error(`获取登录二维码失败：${qr.message || qr.ret}`)
-    return { ticket: qr.qrcode, url: qr.qrcode_img_content || qr.url || '' }
+    const url = String(qr.qrcode_img_content || qr.url || '').trim()
+    if (!url) throw new Error('获取登录二维码失败：缺少二维码内容')
+    return { ticket: qr.qrcode, url }
   }
 
-  async #pollQr(qr, signal) {
+  async #pollQr(qr, signal, onScanned = null) {
+    let scannedHandled = false
     while (!signal.aborted && !this.stopped) {
       try {
-        const response = await fetch(`${ILINK_DEFAULT}/ilink/bot/get_qrcode_status?qrcode=${encodeURIComponent(qr.ticket)}`, {
+        const response = await this.fetch(`${ILINK_DEFAULT}/ilink/bot/get_qrcode_status?qrcode=${encodeURIComponent(qr.ticket)}`, {
           signal: AbortSignal.any([signal, AbortSignal.timeout(45_000)]),
         })
         const value = await response.json()
         if (value.status === 'confirmed') return value
+        if (value.status === 'scaned' && !scannedHandled) {
+          scannedHandled = true
+          await onScanned?.()
+          continue
+        }
         if (value.status === 'expired' || value.status === 'cancelled') throw new Error('二维码已失效')
       } catch (error) {
         if (signal.aborted || this.stopped || error?.message === '二维码已失效') throw error
@@ -239,12 +347,14 @@ export class WeChatClient {
   }
 
   #acceptCredentials(value) {
+    this.credentialEpoch += 1
     this.token = value.bot_token
     this.baseUrl = value.baseurl || ILINK_DEFAULT
     this.state.botToken = this.token
     this.state.baseUrl = this.baseUrl
-    this.state.loginAt = Date.now()
+    this.state.loginAt = this.now()
     delete this.state.updatesBuf
+    delete this.state.renewalNotice
     this.#saveState()
     this.notified = false
   }
@@ -252,7 +362,7 @@ export class WeChatClient {
   async ensureLogin() {
     if (this.token) {
       if (!this.state.loginAt) {
-        this.state.loginAt = Date.now()
+        this.state.loginAt = this.now()
         this.#saveState()
       }
       return false
@@ -275,59 +385,273 @@ export class WeChatClient {
     }
   }
 
-  /** Start a parallel QR renewal while the old token remains usable. */
-  async beginRenewal(recipient, { notify = true, open = true } = {}) {
-    if (this.renewal) return this.renewal.url
-    const qr = await this.#newQrCode()
-    this.#persistQr(qr.url)
-    const controller = new AbortController()
-    this.renewal = { ...qr, controller, startedAt: Date.now(), recipient, lastReminderAt: Date.now(), scanClose: null }
-    // When no recipient can carry the link (settings page / auto-renewal), open
-    // a dedicated scan app-window so the server holds the handle and can close
-    // it automatically right after the scan succeeds. openScanWindow returns a
-    // `{ close }` handle; fall back to the default browser when no browser is
-    // available (that window then closes on its own as the user leaves it).
-    if (!recipient && open) {
-      const scan = openScanWindow(qr.url)
-      this.renewal.scanClose = scan?.close || null
-      if (!scan) openUrl(qr.url)
-    }
-    void this.#pollQr(qr, controller.signal).then(async (value) => {
-      const closeScan = this.renewal?.scanClose
-      if (typeof closeScan === 'function') {
-        try { closeScan() } catch { /* window already gone */ }
-      }
-      this.#acceptCredentials(value)
-      this.renewal = null
-      if (recipient) await this.sendText(recipient, this.state.contextTokens?.[recipient] || '', '✅ 微信连接续期成功。')
-    }).catch((error) => {
-      // Keep swallowing errors silently when the polling was intentionally cancelled.
-      if (this.renewal?.scanClose) {
-        try { this.renewal.scanClose() } catch { /* ignore */ }
-      }
-      if (!controller.signal.aborted) this.warn('[wechat] 续期未完成:', error.message)
-      this.renewal = null
-    })
-    if (notify && recipient && this.token) {
-      const token = this.state.contextTokens?.[recipient] || ''
-      await this.sendText(recipient, token, `🔐 微信登录凭据即将到期，请打开下面链接扫码续期：\n${qr.url}`).catch(error => {
-        this.warn('[wechat] 续期提醒发送失败:', error.message)
-      })
-    }
-    return qr.url
+  #openRenewalWindow(record) {
+    if (record.scanClose) return
+    const scan = openScanWindow(record.url)
+    record.scanClose = scan?.close || null
+    if (!scan) openUrl(record.url)
   }
 
-  async checkRenewal(recipient) {
-    if (!this.token) return
-    if (this.renewal) {
-      if (recipient && Date.now() - this.renewal.lastReminderAt >= 30 * 60 * 1000) {
-        this.renewal.lastReminderAt = Date.now()
-        await this.sendText(recipient, this.state.contextTokens?.[recipient] || '', `⏰ 微信连接仍等待扫码续期：\n${this.renewal.url}`).catch(() => {})
+  #closeRenewalWindow(record) {
+    if (typeof record?.scanClose === 'function') {
+      try { record.scanClose() } catch { /* window already gone */ }
+    }
+    if (record) record.scanClose = null
+  }
+
+  #queueRenewalFeedback(type, recipients, delivery = null) {
+    const values = recipientList(recipients)
+    if (!values.length) return
+    this.state.renewalFeedback = {
+      type,
+      recipients: values,
+      createdAt: this.now(),
+      ...(delivery?.waitForFreshContext ? { waitForFreshContext: true } : {}),
+    }
+    this.feedbackDelivery = delivery ? { feedback: this.state.renewalFeedback, ...delivery } : null
+    this.#saveState()
+  }
+
+  async #flushRenewalFeedback() {
+    const requested = this.state.renewalFeedback
+    if (this.feedbackFlush) {
+      const activeTarget = this.feedbackFlushTarget
+      await this.feedbackFlush
+      if (requested && requested !== activeTarget && this.state.renewalFeedback === requested) {
+        return this.#flushRenewalFeedback()
       }
       return
     }
-    const loginAt = Number(this.state.loginAt || Date.now())
-    if (Date.now() - loginAt >= this.renewAfterMs - this.renewWarnBeforeMs) await this.beginRenewal(recipient)
+    this.feedbackFlushTarget = requested
+    this.feedbackFlush = (async () => {
+      const feedback = this.state.renewalFeedback
+      if (!feedback?.recipients?.length) return
+      const text = feedback.type === 'success'
+        ? '✅ 微信登录续期成功，连接已更新。'
+        : '❌ 微信续签二维码已超时或失效，请重新发送 /renew 获取新二维码。'
+      const remaining = []
+      const delivery = this.feedbackDelivery?.feedback === feedback ? this.feedbackDelivery : null
+      const waitForFreshContext = Boolean(delivery?.waitForFreshContext || feedback.waitForFreshContext || feedback.active)
+      for (const recipient of feedback.recipients) {
+        const contextToken = delivery?.contextTokens?.get(recipient) || this.state.contextTokens?.[recipient] || ''
+        const contextUpdatedAt = Number(this.state.contextTokenUpdatedAt?.[recipient] || 0)
+        if (!contextToken || (waitForFreshContext && contextUpdatedAt <= Number(feedback.createdAt || 0))) {
+          remaining.push(recipient)
+          continue
+        }
+        try {
+          await this.sendText(recipient, contextToken, text, { auth: delivery?.auth })
+          this.log(`[wechat] 续签${feedback.type === 'success' ? '成功' : '失败'}提示请求已被微信接口接受${waitForFreshContext ? '（使用最新入站 context）' : ''}`)
+        } catch (error) {
+          remaining.push(recipient)
+          this.warn(`[wechat] 续签${feedback.type === 'success' ? '成功' : '失败'}提示发送失败:`, error.message)
+        }
+      }
+      if (this.state.renewalFeedback !== feedback) return
+      if (remaining.length) feedback.recipients = remaining
+      else delete this.state.renewalFeedback
+      if (this.feedbackDelivery?.feedback === feedback) this.feedbackDelivery = null
+      this.#saveState()
+    })()
+    try {
+      await this.feedbackFlush
+    } finally {
+      this.feedbackFlush = null
+      this.feedbackFlushTarget = null
+    }
+  }
+
+  async #deliverRenewal(record, recipient) {
+    const contextToken = this.state.contextTokens?.[recipient] || ''
+    if (!recipient || !contextToken || !this.token) return { delivered: false, mode: 'unavailable' }
+    const expiresAt = Number(this.state.loginAt || 0) + this.renewAfterMs
+    const instruction = [
+      `🔐 当前微信连接预计于 ${formatLocalDateTime(expiresAt)} 到期。`,
+      '为避免夜间断连，请现在完成续签。请使用另一台设备展示下方二维码，再打开需要续签的手机微信“扫一扫”，用摄像头扫码并确认授权。',
+      '请勿在当前微信聊天中长按识别，该方式无法完成续签。',
+    ].join('\n')
+    await this.sendText(recipient, contextToken, instruction).catch(error => {
+      this.warn('[wechat] 续签说明发送失败:', error.message)
+    })
+    try {
+      if (!record.pngBuffer) throw new Error('二维码图片不可用')
+      await this.sendImageBuffer(recipient, contextToken, record.pngBuffer, 'dsh-weixin-renewal.png')
+      record.recipients.add(recipient)
+      record.contextTokens.set(recipient, contextToken)
+      return { delivered: true, mode: 'image' }
+    } catch (error) {
+      this.warn('[wechat] 续签二维码图片发送失败，将发送电脑端链接:', error.message)
+      await this.sendText(recipient, contextToken, [
+        '二维码发送失败，请在电脑端完成微信续签！',
+        record.url,
+      ].join('\n'))
+      record.recipients.add(recipient)
+      record.contextTokens.set(recipient, contextToken)
+      return { delivered: true, mode: 'link' }
+    }
+  }
+
+  async #notifyRenewalScanned(record) {
+    if (record.scannedNotified) return
+    record.scannedNotified = true
+    while ([...record.expectedRecipients].some(recipient => !record.deliverySettled.has(recipient))) {
+      if (this.renewal !== record || record.confirmed || record.failed) return
+      await sleep(10)
+    }
+    for (const recipient of record.recipients) {
+      const contextToken = record.contextTokens.get(recipient) || ''
+      if (!contextToken) continue
+      try {
+        await this.sendText(recipient, contextToken, [
+          '👀 已检测到扫码，请在手机上确认授权。确认后微信续签会自动生效。',
+          '续签会刷新微信会话，成功结果将在你下一次发送消息时优先补发。',
+        ].join('\n'), { auth: record.auth })
+        this.log('[wechat] 续签扫码确认提示请求已被微信接口接受')
+      } catch (error) {
+        this.warn('[wechat] 续签扫码确认提示发送失败:', error.message)
+      }
+    }
+  }
+
+  #startRenewalPolling(record) {
+    void this.#pollQr(record, record.controller.signal, () => this.#notifyRenewalScanned(record)).then(async (value) => {
+      if (this.renewal !== record) return
+      record.confirmed = true
+      await Promise.allSettled([...record.deliveries])
+      this.#closeRenewalWindow(record)
+      const recipients = [...record.recipients]
+      record.pngBuffer = null
+      this.#acceptCredentials(value)
+      try {
+        await this.notifyStart({ timeoutMs: 10_000 })
+      } catch (error) {
+        this.warn('[wechat] 新续签连接初始化失败，将在轮询恢复后重试成功提示:', error.message)
+      }
+      // QR confirmation invalidates the previous bot token and does not issue
+      // a replacement context token. Keep the result pending until the user's
+      // next inbound message supplies a context belonging to the new token.
+      this.#queueRenewalFeedback('success', recipients, {
+        waitForFreshContext: true,
+      })
+      this.renewal = null
+      await this.#flushRenewalFeedback()
+    }).catch((error) => {
+      if (this.renewal !== record) return
+      record.failed = true
+      void Promise.allSettled([...record.deliveries]).then(async () => {
+        if (this.renewal !== record) return
+        const recipients = [...record.recipients]
+        this.#closeRenewalWindow(record)
+        record.pngBuffer = null
+        this.renewal = null
+        if (!record.controller.signal.aborted && !this.stopped) {
+          this.warn('[wechat] 续期未完成:', error.message)
+          this.#queueRenewalFeedback('failure', recipients, {
+            auth: record.auth,
+            contextTokens: record.contextTokens,
+          })
+          await this.#flushRenewalFeedback()
+        }
+      }).catch(feedbackError => {
+        this.warn('[wechat] 续签失败反馈处理异常:', feedbackError.message)
+      })
+    })
+  }
+
+  /** Start or reuse a parallel QR renewal while the old token remains usable. */
+  async beginRenewal(recipient, { notify = true, open = true } = {}) {
+    const recipients = recipientList(recipient)
+    let record = this.renewal
+    if (!record) {
+      const qr = await this.#newQrCode()
+      let pngBuffer = null
+      try {
+        pngBuffer = await this.qrEncoder(qr.url)
+      } catch (error) {
+        this.warn('[wechat] 本地生成续签二维码失败，将使用电脑端链接:', error.message)
+      }
+      record = {
+        ...qr,
+        auth: this.#authSnapshot(),
+        pngBuffer,
+        controller: new AbortController(),
+        startedAt: this.now(),
+        scanClose: null,
+        recipients: new Set(),
+        contextTokens: new Map(),
+        deliveries: new Set(),
+        expectedRecipients: new Set(notify ? recipients : []),
+        deliverySettled: new Set(),
+        scannedNotified: false,
+        confirmed: false,
+        failed: false,
+      }
+      this.renewal = record
+      this.#startRenewalPolling(record)
+    }
+    if (notify) for (const userId of recipients) record.expectedRecipients.add(userId)
+    if (!recipients.length && open) this.#openRenewalWindow(record)
+    if (!notify || !recipients.length) {
+      return { pending: true, delivered: false, mode: open ? 'window' : 'pending' }
+    }
+    if (record.confirmed || record.failed) return { pending: false, delivered: false, mode: record.confirmed ? 'confirmed' : 'failed' }
+    const deliveries = []
+    let firstError = null
+    for (const userId of recipients) {
+      if (record.confirmed || record.failed) break
+      let task
+      try {
+        task = this.#deliverRenewal(record, userId)
+        record.deliveries.add(task)
+        deliveries.push({ recipient: userId, ...await task })
+      } catch (error) {
+        firstError ||= error
+        deliveries.push({ recipient: userId, delivered: false, mode: 'failed' })
+        this.warn(`[wechat] 向用户 ${userId} 发送续签二维码失败:`, error.message)
+      } finally {
+        if (task) record.deliveries.delete(task)
+        record.deliverySettled.add(userId)
+      }
+    }
+    const delivered = deliveries.some(item => item.delivered)
+    if (!delivered && firstError) throw firstError
+    if (deliveries.length === 1) return { pending: true, ...deliveries[0] }
+    return { pending: true, delivered, mode: 'multiple', deliveries }
+  }
+
+  async checkRenewal(recipient) {
+    if (!this.token) return null
+    const loginAt = Number(this.state.loginAt || 0)
+    if (!loginAt) return null
+    const expiresAt = loginAt + this.renewAfterMs
+    const now = this.now()
+    const saved = Number(this.state.renewalNotice?.expiresAt) === expiresAt
+      ? this.state.renewalNotice
+      : { recipients: {} }
+    const recipients = recipientList(recipient)
+    const due = []
+    const notices = { ...(saved.recipients || {}) }
+    for (const userId of recipients) {
+      const userNotice = notices[userId] || {}
+      const decision = renewalReminderDecision({
+        expiresAt,
+        now,
+        lastAttemptAt: userNotice.lastAttemptAt,
+        emergencySentAt: userNotice.emergencySentAt,
+        leadMs: this.renewWarnBeforeMs,
+      })
+      if (!decision) continue
+      due.push(userId)
+      notices[userId] = {
+        ...userNotice,
+        lastAttemptAt: now,
+        ...(decision === 'emergency' ? { emergencySentAt: now } : {}),
+      }
+    }
+    if (!due.length) return null
+    this.state.renewalNotice = { expiresAt, recipients: notices }
+    this.#saveState()
+    return this.beginRenewal(due, { notify: true, open: false })
   }
 
   #closeScan() {
@@ -336,7 +660,9 @@ export class WeChatClient {
   }
 
   async pollOnce() {
+    const epoch = this.credentialEpoch
     const value = await this.#ilink('/ilink/bot/getupdates', { get_updates_buf: this.state.updatesBuf || '' })
+    if (epoch !== this.credentialEpoch) return []
     this.lastPollAt = Date.now()
     this.lastSuccessAt = this.lastPollAt
     this.lastError = null
@@ -354,6 +680,7 @@ export class WeChatClient {
       try {
         if (!this.token) await this.ensureLogin()
         if (!this.notified) await this.notifyStart()
+        await this.#flushRenewalFeedback()
         const startedAt = Date.now()
         const messages = await this.pollOnce()
         if (Date.now() - startedAt > this.watchdogMs) this.warn('[wechat] 长轮询响应过慢，已进入下一轮监听')
@@ -364,6 +691,10 @@ export class WeChatClient {
         backoff = 1000
       } catch (error) {
         if (this.stopped) return
+        if (error?.staleCredentials) {
+          backoff = 1000
+          continue
+        }
         this.lastError = error
         this.notified = false
         this.warn(`[wechat] 连接异常，${Math.ceil(backoff / 1000)} 秒后重试：${error.message}`)
@@ -373,14 +704,20 @@ export class WeChatClient {
     }
   }
 
-  rememberContext(userId, contextToken) {
+  async rememberContext(userId, contextToken) {
     if (!contextToken) return
     this.state.contextTokens ||= {}
+    this.state.contextTokenUpdatedAt ||= {}
     this.state.contextTokens[userId] = contextToken
+    this.state.contextTokenUpdatedAt[userId] = this.now()
     this.#saveState()
+    const feedback = this.state.renewalFeedback
+    if ((feedback?.waitForFreshContext || feedback?.active) && feedback.recipients?.includes(userId)) {
+      await this.#flushRenewalFeedback()
+    }
   }
 
-  async sendItems(to, contextToken, itemList) {
+  async sendItems(to, contextToken, itemList, { auth } = {}) {
     const body = {
       msg: {
         from_user_id: '',
@@ -399,7 +736,7 @@ export class WeChatClient {
     let attempt = 0
     for (;;) {
       try {
-        return await this.#ilink('/ilink/bot/sendmessage', body)
+        return await this.#ilink('/ilink/bot/sendmessage', body, { auth })
       } catch (error) {
         // 登录过期不重试；其余错误退避重试，最多 3 次，避免偶发限流丢失整条气泡。
         if (error instanceof SessionExpiredError || ++attempt >= 3) throw error
@@ -408,16 +745,18 @@ export class WeChatClient {
     }
   }
 
-  async sendText(to, contextToken, text, { format = true } = {}) {
+  async sendText(to, contextToken, text, { format = true, auth } = {}) {
     const normalized = format ? formatForWeChat(text) : String(text || '')
-    if (!normalized) return
+    if (!normalized) return []
     let remaining = normalized
+    const responses = []
     while (remaining) {
       const cut = safeTextCut(remaining, this.chunkSize)
       const part = remaining.slice(0, cut).trim()
       remaining = remaining.slice(cut).trimStart()
-      if (part) await this.sendItems(to, contextToken, [{ type: 1, text_item: { text: part } }])
+      if (part) responses.push(await this.sendItems(to, contextToken, [{ type: 1, text_item: { text: part } }], { auth }))
     }
+    return responses
   }
 
   async setTyping(userId, contextToken, active) {
@@ -463,6 +802,11 @@ export class WeChatClient {
     await this.sendItems(to, contextToken, [item])
   }
 
+  async sendImageBuffer(to, contextToken, buffer, fileName = 'image.png') {
+    const item = await uploadOutboundBuffer(this, buffer, to, { fileName, fetchImpl: this.fetch })
+    await this.sendItems(to, contextToken, [item])
+  }
+
   async downloadMedia(message, userKey) {
     const saveDir = path.join(this.mediaDir, String(userKey).replace(/[^a-zA-Z0-9_-]/g, '_'))
     const results = []
@@ -480,10 +824,10 @@ export class WeChatClient {
   stop() {
     this.stopped = true
     this.#closeScan()
-    if (this.renewal?.scanClose) {
-      try { this.renewal.scanClose() } catch { /* ignore */ }
-    }
-    this.renewal?.controller.abort()
+    const renewal = this.renewal
+    this.#closeRenewalWindow(renewal)
+    renewal?.controller.abort()
+    if (renewal) renewal.pngBuffer = null
     this.renewal = null
     void this.notifyStop()
   }

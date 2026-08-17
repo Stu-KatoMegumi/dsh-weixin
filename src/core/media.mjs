@@ -115,16 +115,18 @@ function mediaTypeFor(filePath) {
   return UploadMediaType.FILE
 }
 
-/** Encrypt and upload one local file, returning a sendmessage item. */
-export async function uploadOutboundFile(client, filePath, toUserId) {
-  const info = await stat(filePath)
-  if (!info.isFile()) throw new Error('outbound path is not a file')
-  if (info.size > MEDIA_MAX_BYTES) throw new Error('outbound file exceeds the 50 MB limit')
-  const plaintext = await readFile(filePath)
+/** Encrypt and upload in-memory bytes, returning a sendmessage media item. */
+export async function uploadOutboundBuffer(client, value, toUserId, {
+  fileName = 'file.bin',
+  mediaType = mediaTypeFor(fileName),
+  fetchImpl = globalThis.fetch,
+} = {}) {
+  const plaintext = Buffer.isBuffer(value) ? value : Buffer.from(value || [])
+  if (plaintext.length > MEDIA_MAX_BYTES) throw new Error('outbound buffer exceeds the 50 MB limit')
+  if (typeof fetchImpl !== 'function') throw new Error('media upload fetch is unavailable')
   const key = crypto.randomBytes(16)
   const keyHex = key.toString('hex')
   const filekey = crypto.randomBytes(16).toString('hex')
-  const mediaType = mediaTypeFor(filePath)
   const prepared = await client.getUploadUrl({
     filekey,
     mediaType,
@@ -142,7 +144,7 @@ export async function uploadOutboundFile(client, filePath, toUserId) {
   let lastError
   for (let attempt = 1; attempt <= 3; attempt += 1) {
     try {
-      response = await fetch(uploadUrl, {
+      response = await fetchImpl(uploadUrl, {
         method: 'POST',
         headers: { 'content-type': 'application/octet-stream' },
         body: ciphertext,
@@ -171,6 +173,16 @@ export async function uploadOutboundFile(client, filePath, toUserId) {
   }
   return {
     type: MessageItemType.FILE,
-    file_item: { media, file_name: path.basename(filePath), len: String(plaintext.length) },
+    file_item: { media, file_name: safeName(path.basename(fileName)), len: String(plaintext.length) },
   }
+}
+
+/** Encrypt and upload one local file, returning a sendmessage item. */
+export async function uploadOutboundFile(client, filePath, toUserId) {
+  const info = await stat(filePath)
+  if (!info.isFile()) throw new Error('outbound path is not a file')
+  if (info.size > MEDIA_MAX_BYTES) throw new Error('outbound file exceeds the 50 MB limit')
+  return uploadOutboundBuffer(client, await readFile(filePath), toUserId, {
+    fileName: path.basename(filePath),
+  })
 }

@@ -46,7 +46,6 @@ window.__ModuleLoader__.load({
           setDraft(current => current || {
             ...value.settings,
             allowlistText: (value.settings.allowlist || []).join('\n'),
-            adminsText: (value.settings.admins || []).join('\n'),
             jobsText: JSON.stringify(value.settings.jobs || [], null, 2),
           })
         } catch (error) { setMessage(error.message) }
@@ -66,7 +65,6 @@ window.__ModuleLoader__.load({
             mediaEnabled: draft.mediaEnabled, renewalEnabled: draft.renewalEnabled,
             accessPolicy: draft.accessPolicy,
             allowlist: draft.allowlistText.split(/\r?\n|,/).map(v => v.trim()).filter(Boolean),
-            admins: draft.adminsText.split(/\r?\n|,/).map(v => v.trim()).filter(Boolean),
             streamFlushChars: Number(draft.streamFlushChars), streamFlushMs: Number(draft.streamFlushMs),
             slowAckMs: Number(draft.slowAckMs), turnTimeoutMs: Number(draft.turnTimeoutMs), jobs,
           } })
@@ -95,12 +93,10 @@ window.__ModuleLoader__.load({
           h(Toggle, { title: '流式输出', checked: draft.streaming, onChange: value => set('streaming', value) }),
           h(Toggle, { title: '显示“正在输入”', checked: draft.typing, onChange: value => set('typing', value) }),
           h(Toggle, { title: '媒体/文件收发', checked: draft.mediaEnabled, onChange: value => set('mediaEnabled', value) }),
-          h(Toggle, { title: '24 小时到期前提醒续期', checked: draft.renewalEnabled, onChange: value => set('renewalEnabled', value) })),
+          h(Toggle, { title: '到期前在工作时间提醒全部已知用户续期', checked: draft.renewalEnabled, onChange: value => set('renewalEnabled', value) })),
         h(Field, { title: '私聊权限模式' }, h('select', { style: input, value: draft.accessPolicy, onChange: event => set('accessPolicy', event.target.value) },
           h('option', { value: 'pairing' }, 'pairing - 允许所有私聊'), h('option', { value: 'allowlist' }, 'allowlist - 仅白名单'), h('option', { value: 'disabled' }, 'disabled - 关闭'))),
-        h('div', { style: row },
-          h(Field, { title: '白名单（每行一个用户 ID）' }, h('textarea', { style: { ...input, minHeight: 88 }, value: draft.allowlistText, onChange: event => set('allowlistText', event.target.value) })),
-          h(Field, { title: '管理员（每行一个用户 ID）' }, h('textarea', { style: { ...input, minHeight: 88 }, value: draft.adminsText, onChange: event => set('adminsText', event.target.value) }))),
+        h(Field, { title: '白名单（每行一个用户 ID）' }, h('textarea', { style: { ...input, minHeight: 88 }, value: draft.allowlistText, onChange: event => set('allowlistText', event.target.value) })),
         h('div', { style: row },
           h(Field, { title: '单气泡长度上限（字符，超限强制切分）' }, h('input', { style: input, type: 'number', value: draft.streamFlushChars, onChange: event => set('streamFlushChars', event.target.value) })),
           h(Field, { title: '空闲超时（ms，无新内容自动发出）' }, h('input', { style: input, type: 'number', value: draft.streamFlushMs, onChange: event => set('streamFlushMs', event.target.value) })),
