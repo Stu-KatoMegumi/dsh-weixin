@@ -258,9 +258,16 @@ export class WeChatClient {
       // A long poll started with the previous token may finish after renewal.
       // Never let that stale response invalidate credentials accepted later.
       const staleCredentials = auth.epoch !== this.credentialEpoch || auth.token !== this.token
-      if (!staleCredentials) this.invalidateCredentials()
+      const renewalTransition = Boolean(
+        !staleCredentials
+        && this.renewal
+        && this.renewal.auth?.token === auth.token
+        && !this.renewal.failed,
+      )
+      if (!staleCredentials && !renewalTransition) this.invalidateCredentials()
       const error = new SessionExpiredError()
       error.staleCredentials = staleCredentials
+      error.renewalTransition = renewalTransition
       throw error
     }
     if (!response.ok || (typeof value?.ret === 'number' && value.ret !== 0)) {
@@ -346,17 +353,31 @@ export class WeChatClient {
     fs.writeFileSync(path.join(path.dirname(this.stateFile), 'qrcode.txt'), `${url}\n`, 'utf8')
   }
 
-  #acceptCredentials(value) {
+  #stageCredentials(value) {
+    const credentials = {
+      token: String(value.bot_token || ''),
+      baseUrl: value.baseurl || ILINK_DEFAULT,
+    }
+    if (!credentials.token) throw new Error('续签确认响应缺少 bot token')
     this.credentialEpoch += 1
-    this.token = value.bot_token
-    this.baseUrl = value.baseurl || ILINK_DEFAULT
-    this.state.botToken = this.token
-    this.state.baseUrl = this.baseUrl
+    this.state.botToken = credentials.token
+    this.state.baseUrl = credentials.baseUrl
     this.state.loginAt = this.now()
     delete this.state.updatesBuf
     delete this.state.renewalNotice
     this.#saveState()
     this.notified = false
+    return credentials
+  }
+
+  #activateCredentials(credentials) {
+    this.token = credentials.token
+    this.baseUrl = credentials.baseUrl
+  }
+
+  #acceptCredentials(value) {
+    const credentials = this.#stageCredentials(value)
+    this.#activateCredentials(credentials)
   }
 
   async ensureLogin() {
@@ -504,7 +525,7 @@ export class WeChatClient {
       try {
         await this.sendText(recipient, contextToken, [
           '👀 已检测到扫码，请在手机上确认授权。确认后微信续签会自动生效。',
-          '续签会刷新微信会话，成功结果将在你下一次发送消息时优先补发。',
+          '确认完成后，程序会立即发送续签结果。',
         ].join('\n'), { auth: record.auth })
         this.log('[wechat] 续签扫码确认提示请求已被微信接口接受')
       } catch (error) {
@@ -513,30 +534,73 @@ export class WeChatClient {
     }
   }
 
+  async #sendRenewalSuccessFromNewConnection(recipient, contextToken) {
+    try {
+      await this.#ilink('/ilink/bot/getconfig', {
+        ilink_user_id: recipient,
+        context_token: contextToken || '',
+      }, { timeoutMs: 10_000 })
+    } catch (error) {
+      this.warn('[wechat] 新连接用户路由预热失败，仍将尝试主动发送续签结果:', error.message)
+    }
+    await this.sendText(recipient, contextToken, '✅ 微信登录续期成功，连接已更新。')
+    this.log('[wechat] 续签成功主动消息请求已通过新连接提交')
+  }
+
   #startRenewalPolling(record) {
     void this.#pollQr(record, record.controller.signal, () => this.#notifyRenewalScanned(record)).then(async (value) => {
-      if (this.renewal !== record) return
+      if (this.renewal !== record) {
+        record.resolveSettled()
+        return
+      }
       record.confirmed = true
       await Promise.allSettled([...record.deliveries])
       this.#closeRenewalWindow(record)
       const recipients = [...record.recipients]
       record.pngBuffer = null
-      this.#acceptCredentials(value)
+      const credentials = this.#stageCredentials(value)
+      const pendingRecipients = []
+      try {
+        for (const recipient of recipients) {
+          const contextToken = record.contextTokens.get(recipient) || ''
+          if (!contextToken) {
+            pendingRecipients.push(recipient)
+            continue
+          }
+          try {
+            await this.sendText(recipient, contextToken, '✅ 微信登录续期成功，连接已更新。', { auth: record.auth })
+            this.log('[wechat] 续签成功提示已在新连接上线前提交给旧会话')
+          } catch (error) {
+            pendingRecipients.push(recipient)
+            this.warn('[wechat] 续签成功提示无法通过旧会话即时发送，将尝试新连接主动发送:', error.message)
+          }
+        }
+      } finally {
+        this.#activateCredentials(credentials)
+      }
       try {
         await this.notifyStart({ timeoutMs: 10_000 })
       } catch (error) {
-        this.warn('[wechat] 新续签连接初始化失败，将在轮询恢复后重试成功提示:', error.message)
+        this.warn('[wechat] 新续签连接初始化失败，仍将尝试主动发送续签结果:', error.message)
       }
-      // QR confirmation invalidates the previous bot token and does not issue
-      // a replacement context token. Keep the result pending until the user's
-      // next inbound message supplies a context belonging to the new token.
-      this.#queueRenewalFeedback('success', recipients, {
-        waitForFreshContext: true,
-      })
+      for (const recipient of pendingRecipients) {
+        const contextToken = record.contextTokens.get(recipient) || ''
+        const target = pendingRecipients.length === 1 && value.ilink_user_id
+          ? String(value.ilink_user_id)
+          : recipient
+        try {
+          await this.#sendRenewalSuccessFromNewConnection(target, contextToken)
+        } catch (error) {
+          this.warn('[wechat] 续签成功主动消息发送失败:', error.message)
+        }
+      }
       this.renewal = null
-      await this.#flushRenewalFeedback()
+      record.resolveSettled()
     }).catch((error) => {
-      if (this.renewal !== record) return
+      if (this.renewal !== record) {
+        record.resolveSettled()
+        return
+      }
       record.failed = true
       void Promise.allSettled([...record.deliveries]).then(async () => {
         if (this.renewal !== record) return
@@ -552,8 +616,10 @@ export class WeChatClient {
           })
           await this.#flushRenewalFeedback()
         }
+        record.resolveSettled()
       }).catch(feedbackError => {
         this.warn('[wechat] 续签失败反馈处理异常:', feedbackError.message)
+        record.resolveSettled()
       })
     })
   }
@@ -570,6 +636,8 @@ export class WeChatClient {
       } catch (error) {
         this.warn('[wechat] 本地生成续签二维码失败，将使用电脑端链接:', error.message)
       }
+      let resolveSettled
+      const settled = new Promise(resolve => { resolveSettled = resolve })
       record = {
         ...qr,
         auth: this.#authSnapshot(),
@@ -585,6 +653,8 @@ export class WeChatClient {
         scannedNotified: false,
         confirmed: false,
         failed: false,
+        settled,
+        resolveSettled,
       }
       this.renewal = record
       this.#startRenewalPolling(record)
@@ -691,6 +761,12 @@ export class WeChatClient {
         backoff = 1000
       } catch (error) {
         if (this.stopped) return
+        if (error?.renewalTransition) {
+          const renewal = this.renewal
+          if (renewal) await renewal.settled
+          backoff = 1000
+          continue
+        }
         if (error?.staleCredentials) {
           backoff = 1000
           continue
@@ -711,10 +787,6 @@ export class WeChatClient {
     this.state.contextTokens[userId] = contextToken
     this.state.contextTokenUpdatedAt[userId] = this.now()
     this.#saveState()
-    const feedback = this.state.renewalFeedback
-    if ((feedback?.waitForFreshContext || feedback?.active) && feedback.recipients?.includes(userId)) {
-      await this.#flushRenewalFeedback()
-    }
   }
 
   async sendItems(to, contextToken, itemList, { auth } = {}) {
@@ -827,7 +899,10 @@ export class WeChatClient {
     const renewal = this.renewal
     this.#closeRenewalWindow(renewal)
     renewal?.controller.abort()
-    if (renewal) renewal.pngBuffer = null
+    if (renewal) {
+      renewal.pngBuffer = null
+      renewal.resolveSettled()
+    }
     this.renewal = null
     void this.notifyStop()
   }

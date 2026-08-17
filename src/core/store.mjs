@@ -29,6 +29,23 @@ export function safeKey(userKey) {
   return `${readable}-${crypto.createHash('sha256').update(source).digest('hex').slice(0, 10)}`
 }
 
+function safeHistoryKey(historyKey) {
+  const source = String(historyKey)
+  const readable = source.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 80) || 'session'
+  return `${readable}-${crypto.createHash('sha256').update(source).digest('hex').slice(0, 8)}`
+}
+
+/** Return the calendar date used by session and history rotation. */
+export function localDateKey(date = new Date()) {
+  const value = date instanceof Date ? date : new Date(date)
+  if (Number.isNaN(value.getTime())) throw new TypeError('Invalid date')
+  return [
+    value.getFullYear(),
+    String(value.getMonth() + 1).padStart(2, '0'),
+    String(value.getDate()).padStart(2, '0'),
+  ].join('-')
+}
+
 /** Durable state shared by plugin and standalone modes. */
 export class Store {
   constructor(dir) {
@@ -72,23 +89,33 @@ export class Store {
       ...(contextToken ? { lastContextToken: contextToken } : {}),
     }
     atomicWrite(this.usersFile, JSON.stringify(users, null, 2) + '\n')
+    if (extra.historyKey) this.ensureHistory(key, extra.historyKey)
     return users[key]
   }
 
-  historyFile(userKey) {
-    return path.join(this.historyDir, `${safeKey(userKey)}.jsonl`)
+  historyFile(userKey, historyKey = null) {
+    const suffix = historyKey ? `--${safeHistoryKey(historyKey)}` : ''
+    return path.join(this.historyDir, `${safeKey(userKey)}${suffix}.jsonl`)
+  }
+
+  ensureHistory(userKey, historyKey) {
+    const file = this.historyFile(userKey, historyKey)
+    fs.mkdirSync(path.dirname(file), { recursive: true })
+    if (!fs.existsSync(file)) fs.writeFileSync(file, '', { encoding: 'utf8', mode: 0o600 })
+    return file
   }
 
   appendHistory(userKey, role, text, extra = {}) {
-    const file = this.historyFile(userKey)
+    const file = this.historyFile(userKey, extra.historyKey)
     const line = JSON.stringify({ t: Date.now(), role, text: String(text), ...extra }) + '\n'
     fs.mkdirSync(path.dirname(file), { recursive: true })
     fs.appendFileSync(file, line, 'utf8')
   }
 
-  readHistory(userKey, limit = Infinity) {
+  readHistory(userKey, limit = Infinity, historyKey = null) {
     try {
-      const rows = fs.readFileSync(this.historyFile(userKey), 'utf8')
+      const activeKey = historyKey ?? this.getUser(userKey)?.historyKey ?? null
+      const rows = fs.readFileSync(this.historyFile(userKey, activeKey), 'utf8')
         .split(/\r?\n/)
         .filter(Boolean)
         .map(line => JSON.parse(line))

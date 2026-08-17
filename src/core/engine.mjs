@@ -1,13 +1,20 @@
+import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import { formatQuestions } from './wechat.mjs'
 import { safeTextCut } from './format.mjs'
 import { cronMatches, minuteKey } from './scheduler.mjs'
 import { PROMPT_FILES, ensurePromptFiles, renderPrompt, readPromptFile, writePromptFile, resetPromptFile, editablePromptDir } from './prompt.mjs'
+import { localDateKey } from './store.mjs'
 
 const ACTION_RE = /(写|改|创建|生成|删除|移动|复制|运行|执行|启动|停止|安装|下载|上传|搜索|查询|查找|分析|总结|整理|重构|调试|测试|构建|打包|部署|提交|推送|合并|克隆|备份|翻译|转换|解压|代码|脚本|命令|文件|项目|docker|git|npm|pnpm|node|python|pip|ssh|sql|api)/i
 const FLASH_PROVIDER = 'deepseek-official'
 const FLASH_MODEL = 'deepseek-v4-flash'
+const SESSION_VERSION = 2
+
+function hashText(value) {
+  return crypto.createHash('sha256').update(String(value)).digest('hex')
+}
 
 function stringList(value) {
   if (Array.isArray(value)) return value.map(String).map(item => item.trim()).filter(Boolean)
@@ -237,7 +244,7 @@ export class StreamRelay {
 }
 
 export class Engine {
-  constructor({ wechat, store, transport, config = {}, promptDir = null, defaultPromptDir = null, logger = null }) {
+  constructor({ wechat, store, transport, config = {}, promptDir = null, defaultPromptDir = null, logger = null, now = () => new Date() }) {
     this.wechat = wechat
     this.store = store
     this.transport = transport
@@ -248,12 +255,14 @@ export class Engine {
     }
     this.baseConfig = { ...config }
     this.config = normalizeConfig({ ...config, ...store.loadSettings() })
+    this.now = now
     // 可定制 prompt：可编辑副本位于频道数据目录，默认文件位于项目 src/prompt/
     this.promptDir = promptDir || editablePromptDir(store.dir)
     this.defaultPromptDir = defaultPromptDir || path.join(process.cwd(), 'src', 'prompt')
     ensurePromptFiles(this.defaultPromptDir, this.promptDir)
     this.userBySession = new Map()
     this.activeTurns = new Map()
+    this.sessionLocks = new Map()
     this.started = false
     this.maintenanceTimer = null
     this.jobRuns = new Map()
@@ -290,6 +299,7 @@ export class Engine {
     this.maintenanceTimer = null
     this.wechat.stop()
     this.transport.stop()
+    this.sessionLocks.clear()
     this.store.releaseLock()
   }
 
@@ -350,10 +360,10 @@ export class Engine {
       const record = await this.#ensureUser(userKey, contextToken)
       this.logger.log(`[engine] ${userKey} -> 会话 ${record.sessionId}`)
       if (text.startsWith('/')) {
-        await this.#command(userKey, contextToken, record.sessionId, text)
+        await this.#command(userKey, contextToken, record, text)
         return
       }
-      await this.#runTurn(userKey, contextToken, record.sessionId, text)
+      await this.#runTurn(userKey, contextToken, record, text)
     } catch (error) {
       this.store.appendError('message', error, { userKey })
       this.logger.error('[engine] 消息处理失败:', error.message)
@@ -363,19 +373,52 @@ export class Engine {
   }
 
   async #ensureUser(userKey, contextToken) {
+    const previous = this.sessionLocks.get(userKey) || Promise.resolve()
+    const current = previous.catch(() => {}).then(() => this.#ensureUserOnce(userKey, contextToken))
+    this.sessionLocks.set(userKey, current)
+    try {
+      return await current
+    } finally {
+      if (this.sessionLocks.get(userKey) === current) this.sessionLocks.delete(userKey)
+    }
+  }
+
+  async #ensureUserOnce(userKey, contextToken) {
     const saved = this.store.getUser(userKey)
-    const created = await this.transport.ensureSession(userKey, saved?.sessionId ? { sessionId: saved.sessionId } : {})
+    const now = this.now()
+    const dateKey = localDateKey(now)
+    const promptText = renderPrompt(this.promptDir, { date: now })
+    const promptHash = hashText(promptText)
+    const rotate = !saved?.sessionId
+      || saved.sessionVersion !== SESSION_VERSION
+      || saved.sessionDate !== dateKey
+      || !saved.historyKey
+      || saved.promptHash !== promptHash
+    const created = await this.transport.ensureSession(userKey, rotate
+      ? { fresh: true }
+      : { sessionId: saved.sessionId })
     const sessionId = sessionIdFrom(created) || saved?.sessionId
     if (!sessionId) throw new Error('DSH 未返回会话 ID')
-    const record = this.store.touchUser(userKey, sessionId, contextToken)
+    const historyKey = rotate ? `${dateKey}-${crypto.randomUUID()}` : saved.historyKey
+    const record = this.store.touchUser(userKey, sessionId, contextToken, {
+      sessionVersion: SESSION_VERSION,
+      sessionDate: dateKey,
+      historyKey,
+      promptHash,
+      promptInjected: rotate ? false : saved.promptInjected === true,
+    })
+    // Keep the snapshot used for this turn in memory only. It is intentionally
+    // not persisted because prompt files are editable and are hashed above.
+    record.promptText = rotate || record.promptInjected !== true ? promptText : ''
     this.userBySession.set(sessionId, { from: userKey, token: contextToken })
     return record
   }
 
-  async #runTurn(userKey, contextToken, sessionId, text) {
+  async #runTurn(userKey, contextToken, record, text) {
+    const sessionId = record.sessionId
     const pending = this.transport.pendingQuestion(sessionId)
     if (pending) {
-      this.store.appendHistory(userKey, 'user', text)
+      this.store.appendHistory(userKey, 'user', text, { historyKey: record.historyKey })
       await this.transport.answerQuestion(pending.rpcId, sessionId, text)
       await this.wechat.sendText(userKey, contextToken, '已收到你的回答，继续处理中。')
       return
@@ -387,13 +430,34 @@ export class Engine {
     const gen = (prev?.gen ?? 0) + 1
     this.activeTurns.set(userKey, { sessionId, gen })
 
-    this.store.appendHistory(userKey, 'user', text)
+    this.store.appendHistory(userKey, 'user', text, { historyKey: record.historyKey })
     const complex = text.length > 40 || ACTION_RE.test(text)
     if (complex && !this.config.streaming) await this.wechat.sendText(userKey, contextToken, this.config.complexAckText)
+    const willInjectPrompt = Boolean(record.promptText)
+    if (willInjectPrompt) {
+      // Reserve the one-shot prompt before any awaited operation. This keeps
+      // two nearly simultaneous inbound messages from both injecting it.
+      this.store.touchUser(userKey, sessionId, contextToken, {
+        sessionVersion: SESSION_VERSION,
+        sessionDate: record.sessionDate,
+        historyKey: record.historyKey,
+        promptHash: record.promptHash,
+        promptInjected: true,
+      })
+    }
     try {
       await this.#selectModel(sessionId, complex ? this.config.complexModel : this.config.fastModel)
     } catch (error) {
       if (this.activeTurns.get(userKey)?.gen === gen) this.activeTurns.delete(userKey)
+      if (willInjectPrompt && this.store.getUser(userKey)?.sessionId === sessionId) {
+        this.store.touchUser(userKey, sessionId, contextToken, {
+          sessionVersion: SESSION_VERSION,
+          sessionDate: record.sessionDate,
+          historyKey: record.historyKey,
+          promptHash: record.promptHash,
+          promptInjected: false,
+        })
+      }
       throw error
     }
     if (this.config.typing) await this.wechat.setTyping(userKey, contextToken, true)
@@ -406,27 +470,46 @@ export class Engine {
       flushMs: this.config.streamFlushMs,
       logger: this.logger,
     })
+    let askAccepted = false
     try {
-      const reply = await this.transport.ask(sessionId, this.#buildPromptMessage(text), {
+      const reply = await this.transport.ask(sessionId, this.#buildPromptMessage(text, record.promptText), {
         timeoutMs: this.config.turnTimeoutMs,
         slowMs: complex ? 0 : this.config.slowAckMs,
         onDelta: delta => relay.push(delta),
       })
+      askAccepted = true
       if (this.activeTurns.get(userKey)?.gen !== gen) return
-      this.store.appendHistory(userKey, 'assistant', reply || '')
+      this.store.touchUser(userKey, sessionId, contextToken, {
+        sessionVersion: SESSION_VERSION,
+        sessionDate: record.sessionDate,
+        historyKey: record.historyKey,
+        promptHash: record.promptHash,
+        promptInjected: true,
+      })
+      this.store.appendHistory(userKey, 'assistant', reply || '', { historyKey: record.historyKey })
       await relay.finish(reply)
     } catch (error) {
       // 被打断（版本号已变化）时静默；否则抛给上层按真实错误处理。
-      if (this.activeTurns.get(userKey)?.gen === gen) throw error
+      if (this.activeTurns.get(userKey)?.gen === gen) {
+        if (willInjectPrompt && !askAccepted && this.store.getUser(userKey)?.sessionId === sessionId) {
+          this.store.touchUser(userKey, sessionId, contextToken, {
+            sessionVersion: SESSION_VERSION,
+            sessionDate: record.sessionDate,
+            historyKey: record.historyKey,
+            promptHash: record.promptHash,
+            promptInjected: false,
+          })
+        }
+        throw error
+      }
     } finally {
       if (this.activeTurns.get(userKey)?.gen === gen) this.activeTurns.delete(userKey)
       if (this.config.typing) await this.wechat.setTyping(userKey, contextToken, false)
     }
   }
 
-  /** 把可定制 prompt 渲染后拼到用户消息前（每次读取，改文件即热生效）。 */
-  #buildPromptMessage(text) {
-    const prompt = renderPrompt(this.promptDir)
+  /** 把新 session 首轮使用的 prompt 拼到用户消息前，后续轮次不重复发送。 */
+  #buildPromptMessage(text, prompt = '') {
     if (!prompt) return text
     return [
       '[系统设定（来自 dsh-weixin 定制，非用户输入，请始终遵守）]',
@@ -459,7 +542,8 @@ export class Engine {
     return { name, reset: true }
   }
 
-  async #command(userKey, token, sessionId, input) {
+  async #command(userKey, token, record, input) {
+    const sessionId = record.sessionId
     const [command, ...args] = input.trim().split(/\s+/)
     if (command === '/help' || command === '/?') {
       await this.wechat.sendText(userKey, token, [
@@ -471,10 +555,24 @@ export class Engine {
       return
     }
     if (command === '/new') {
+      const active = this.activeTurns.get(userKey)
+      if (active) {
+        await this.transport.cancel(active.sessionId).catch(() => {})
+        if (this.activeTurns.get(userKey) === active) this.activeTurns.delete(userKey)
+      }
       const created = await this.transport.ensureSession(userKey, { fresh: true })
       const freshId = sessionIdFrom(created)
       if (!freshId) throw new Error('DSH 创建新会话失败')
-      this.store.touchUser(userKey, freshId, token)
+      const now = this.now()
+      const dateKey = localDateKey(now)
+      const promptText = renderPrompt(this.promptDir, { date: now })
+      this.store.touchUser(userKey, freshId, token, {
+        sessionVersion: SESSION_VERSION,
+        sessionDate: dateKey,
+        historyKey: `${dateKey}-${crypto.randomUUID()}`,
+        promptHash: hashText(promptText),
+        promptInjected: false,
+      })
       this.userBySession.set(freshId, { from: userKey, token })
       await this.wechat.sendText(userKey, token, `已开始新会话：${freshId}`)
       return
@@ -584,7 +682,7 @@ export class Engine {
         const user = this.store.getUser(job.userId)
         if (!user?.lastContextToken) continue
         const record = await this.#ensureUser(job.userId, user.lastContextToken)
-        void this.#runTurn(job.userId, user.lastContextToken, record.sessionId, job.prompt).catch(error => {
+        void this.#runTurn(job.userId, user.lastContextToken, record, job.prompt).catch(error => {
           this.store.appendError('cron', error, { jobId: job.id })
         })
       }
