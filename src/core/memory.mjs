@@ -2,8 +2,10 @@ import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 
-export const MEMORY_START = '[[DSH_MEMORY_OPS]]'
-export const MEMORY_END = '[[/DSH_MEMORY_OPS]]'
+export const MEMORY_START = '[DSH_MEMORY_OPS]'
+export const MEMORY_END = '[/DSH_MEMORY_OPS]'
+export const LEGACY_MEMORY_START = '[[DSH_MEMORY_OPS]]'
+export const LEGACY_MEMORY_END = '[[/DSH_MEMORY_OPS]]'
 export const MAX_MEMORY_FILE_BYTES = 60 * 1024
 export const MAX_MEMORY_CONTENT_CHARS = 500
 export const MAX_MEMORY_OPERATIONS = 5
@@ -114,15 +116,38 @@ export function resetMemoryFile(defaultPromptDir, targetFile) {
   writeMemoryFile(targetFile, readMemoryFile(path.join(defaultPromptDir, 'memory.md')) ?? '# 背景记忆\n')
 }
 
+function firstMarker(text, markers, from = 0) {
+  let found = null
+  for (const marker of markers) {
+    const index = text.indexOf(marker, from)
+    if (index >= 0 && (!found || index < found.index)) found = { index, marker }
+  }
+  return found
+}
+
+function markerPrefixTailLength(text, markers) {
+  let keep = 0
+  for (const marker of markers) {
+    const maximum = Math.min(text.length, marker.length - 1)
+    for (let length = maximum; length > keep; length -= 1) {
+      if (text.endsWith(marker.slice(0, length))) {
+        keep = length
+        break
+      }
+    }
+  }
+  return keep
+}
+
 /** Parse and remove the model-only control block from a completed reply. */
 export function parseMemoryResponse(value) {
   const text = String(value || '')
-  const start = text.indexOf(MEMORY_START)
-  if (start < 0) return { text, operations: [] }
-  const end = text.indexOf(MEMORY_END, start + MEMORY_START.length)
-  const visible = `${text.slice(0, start)}${end < 0 ? '' : text.slice(end + MEMORY_END.length)}`.trim()
-  if (end < 0) return { text: visible, operations: [] }
-  const payload = text.slice(start + MEMORY_START.length, end).trim()
+  const start = firstMarker(text, [LEGACY_MEMORY_START, MEMORY_START])
+  if (!start) return { text, operations: [] }
+  const end = firstMarker(text, [LEGACY_MEMORY_END, MEMORY_END], start.index + start.marker.length)
+  const visible = `${text.slice(0, start.index)}${end ? text.slice(end.index + end.marker.length) : ''}`.trim()
+  if (!end) return { text: visible, operations: [] }
+  const payload = text.slice(start.index + start.marker.length, end.index).trim()
   try {
     const parsed = JSON.parse(payload)
     const operations = Array.isArray(parsed) ? parsed : parsed?.operations
@@ -145,14 +170,15 @@ export class MemoryStreamFilter {
   push(delta) {
     if (!delta || this.hidden) return ''
     this.pending += String(delta)
-    const start = this.pending.indexOf(MEMORY_START)
-    if (start >= 0) {
-      const visible = this.pending.slice(0, start)
+    const markers = [LEGACY_MEMORY_START, MEMORY_START]
+    const start = firstMarker(this.pending, markers)
+    if (start) {
+      const visible = this.pending.slice(0, start.index)
       this.pending = ''
       this.hidden = true
       return visible
     }
-    const keep = Math.min(this.pending.length, MEMORY_START.length - 1)
+    const keep = markerPrefixTailLength(this.pending, markers)
     const visible = this.pending.slice(0, this.pending.length - keep)
     this.pending = this.pending.slice(this.pending.length - keep)
     return visible
