@@ -1,13 +1,16 @@
 // src/core/prompt.mjs — 可定制 prompt 文件体系
 //
-// 项目内 src/prompt/ 提供默认文件（system-prompt.md / soul.md / rules.md /
-// memory.md）；运行时在频道数据目录（sessionDir/prompt/）维护可编辑副本，
-// 首次启动自动从默认目录复制。每次消息前重新读取并渲染，改文件即热生效。
+// 项目内 src/prompt/ 提供默认文件。system-prompt.md / soul.md / rules.md
+// 在 sessionDir/prompt/ 维护可编辑副本；memory.md 单独保存在
+// sessionDir/memory/，由模型和用户共同维护。
 
 import fs from 'node:fs'
 import path from 'node:path'
 
-export const PROMPT_FILES = ['system-prompt.md', 'soul.md', 'rules.md', 'memory.md']
+import { MEMORY_PROTOCOL, readMemoryFile } from './memory.mjs'
+
+export const STATIC_PROMPT_FILES = ['system-prompt.md', 'soul.md', 'rules.md']
+export const PROMPT_FILES = [...STATIC_PROMPT_FILES, 'memory.md']
 
 const PROMPT_LABELS = {
   'system-prompt.md': '系统设定',
@@ -27,7 +30,7 @@ export function editablePromptDir(sessionDir) {
 /** 确保可编辑副本存在：缺失的文件从默认目录复制（默认文件缺失时写空文件兜底）。 */
 export function ensurePromptFiles(defaultDir, targetDir) {
   fs.mkdirSync(targetDir, { recursive: true })
-  for (const file of PROMPT_FILES) {
+  for (const file of STATIC_PROMPT_FILES) {
     const target = path.join(targetDir, file)
     if (fs.existsSync(target)) continue
     try {
@@ -39,9 +42,9 @@ export function ensurePromptFiles(defaultDir, targetDir) {
 }
 
 /** 按固定顺序读取并拼接 prompt 文件，支持 {date} 占位符。 */
-export function renderPrompt(promptDir, { date = new Date() } = {}) {
+export function renderPrompt(promptDir, { date = new Date(), memoryFile = null, includeMemory = true } = {}) {
   const blocks = []
-  for (const file of PROMPT_FILES) {
+  for (const file of STATIC_PROMPT_FILES) {
     let content = ''
     try {
       content = fs.readFileSync(path.join(promptDir, file), 'utf8')
@@ -55,6 +58,13 @@ export function renderPrompt(promptDir, { date = new Date() } = {}) {
     const label = PROMPT_LABELS[file] || file
     blocks.push(`## ${label}\n\n${content}`)
   }
+  if (includeMemory && memoryFile) {
+    let content = (readMemoryFile(memoryFile) || '').trim()
+    const lines = content.split(/\r?\n/)
+    if (/^#\s+/.test(lines[0] || '')) content = lines.slice(1).join('\n').trim()
+    if (content) blocks.push(`## ${PROMPT_LABELS['memory.md']}（不可信数据）\n\n${content}`)
+  }
+  blocks.push(MEMORY_PROTOCOL)
   const dateText = [
     date.getFullYear(),
     String(date.getMonth() + 1).padStart(2, '0'),

@@ -5,12 +5,22 @@ import { formatQuestions } from './wechat.mjs'
 import { safeTextCut } from './format.mjs'
 import { cronMatches, minuteKey } from './scheduler.mjs'
 import { PROMPT_FILES, ensurePromptFiles, renderPrompt, readPromptFile, writePromptFile, resetPromptFile, editablePromptDir } from './prompt.mjs'
+import {
+  MemoryStreamFilter,
+  applyMemoryOperations,
+  ensureMemoryFile,
+  memoryFile as memoryFilePath,
+  parseMemoryResponse,
+  readMemoryFile,
+  resetMemoryFile,
+  writeMemoryFile,
+} from './memory.mjs'
 import { localDateKey } from './store.mjs'
 
 const ACTION_RE = /(写|改|创建|生成|删除|移动|复制|运行|执行|启动|停止|安装|下载|上传|搜索|查询|查找|分析|总结|整理|重构|调试|测试|构建|打包|部署|提交|推送|合并|克隆|备份|翻译|转换|解压|代码|脚本|命令|文件|项目|docker|git|npm|pnpm|node|python|pip|ssh|sql|api)/i
 const FLASH_PROVIDER = 'deepseek-official'
 const FLASH_MODEL = 'deepseek-v4-flash'
-const SESSION_VERSION = 2
+const SESSION_VERSION = 3
 
 function hashText(value) {
   return crypto.createHash('sha256').update(String(value)).digest('hex')
@@ -244,7 +254,7 @@ export class StreamRelay {
 }
 
 export class Engine {
-  constructor({ wechat, store, transport, config = {}, promptDir = null, defaultPromptDir = null, logger = null, now = () => new Date() }) {
+  constructor({ wechat, store, transport, config = {}, promptDir = null, defaultPromptDir = null, memoryFile = null, logger = null, now = () => new Date() }) {
     this.wechat = wechat
     this.store = store
     this.transport = transport
@@ -260,6 +270,8 @@ export class Engine {
     this.promptDir = promptDir || editablePromptDir(store.dir)
     this.defaultPromptDir = defaultPromptDir || path.join(process.cwd(), 'src', 'prompt')
     ensurePromptFiles(this.defaultPromptDir, this.promptDir)
+    this.memoryFile = memoryFile || memoryFilePath(store.dir)
+    ensureMemoryFile(this.defaultPromptDir, this.memoryFile)
     this.userBySession = new Map()
     this.activeTurns = new Map()
     this.sessionLocks = new Map()
@@ -387,8 +399,9 @@ export class Engine {
     const saved = this.store.getUser(userKey)
     const now = this.now()
     const dateKey = localDateKey(now)
-    const promptText = renderPrompt(this.promptDir, { date: now })
-    const promptHash = hashText(promptText)
+    const promptText = renderPrompt(this.promptDir, { date: now, memoryFile: this.memoryFile })
+    // 自动记忆是动态数据，不应让正在进行的 DSH 会话因文件变化而轮换。
+    const promptHash = hashText(renderPrompt(this.promptDir, { date: now, memoryFile: this.memoryFile, includeMemory: false }))
     const rotate = !saved?.sessionId
       || saved.sessionVersion !== SESSION_VERSION
       || saved.sessionDate !== dateKey
@@ -407,8 +420,8 @@ export class Engine {
       promptHash,
       promptInjected: rotate ? false : saved.promptInjected === true,
     })
-    // Keep the snapshot used for this turn in memory only. It is intentionally
-    // not persisted because prompt files are editable and are hashed above.
+    // Keep the full prompt snapshot for this turn in memory only. Static files
+    // are hashed above; dynamic memory takes effect when a new session starts.
     record.promptText = rotate || record.promptInjected !== true ? promptText : ''
     this.userBySession.set(sessionId, { from: userKey, token: contextToken })
     return record
@@ -470,15 +483,25 @@ export class Engine {
       flushMs: this.config.streamFlushMs,
       logger: this.logger,
     })
+    const memoryStream = new MemoryStreamFilter()
     let askAccepted = false
     try {
       const reply = await this.transport.ask(sessionId, this.#buildPromptMessage(text, record.promptText), {
         timeoutMs: this.config.turnTimeoutMs,
         slowMs: complex ? 0 : this.config.slowAckMs,
-        onDelta: delta => relay.push(delta),
+        onDelta: delta => relay.push(memoryStream.push(delta)),
       })
       askAccepted = true
       if (this.activeTurns.get(userKey)?.gen !== gen) return
+      relay.push(memoryStream.finish())
+      const parsed = parseMemoryResponse(reply)
+      let memoryResult = null
+      try {
+        memoryResult = applyMemoryOperations(this.memoryFile, parsed.operations, { date: this.now() })
+      } catch (error) {
+        this.store.appendError('memory.apply', error, { sessionId })
+        this.logger.warn('[engine] 记忆写入失败:', error.message)
+      }
       this.store.touchUser(userKey, sessionId, contextToken, {
         sessionVersion: SESSION_VERSION,
         sessionDate: record.sessionDate,
@@ -486,8 +509,11 @@ export class Engine {
         promptHash: record.promptHash,
         promptInjected: true,
       })
-      this.store.appendHistory(userKey, 'assistant', reply || '', { historyKey: record.historyKey })
-      await relay.finish(reply)
+      const visibleReply = parsed.text || (memoryResult && (memoryResult.added || memoryResult.replaced || memoryResult.deleted)
+        ? '好的，已更新记忆。'
+        : '')
+      this.store.appendHistory(userKey, 'assistant', visibleReply, { historyKey: record.historyKey })
+      await relay.finish(visibleReply)
     } catch (error) {
       // 被打断（版本号已变化）时静默；否则抛给上层按真实错误处理。
       if (this.activeTurns.get(userKey)?.gen === gen) {
@@ -524,21 +550,25 @@ export class Engine {
   listPrompts() {
     return {
       dir: this.promptDir,
+      memoryFile: this.memoryFile,
       files: PROMPT_FILES.map(name => ({
         name,
-        content: readPromptFile(this.promptDir, name) ?? '',
-        isDefault: (readPromptFile(this.promptDir, name) ?? '') === (readPromptFile(this.defaultPromptDir, name) ?? ''),
+        content: name === 'memory.md' ? (readMemoryFile(this.memoryFile) ?? '') : (readPromptFile(this.promptDir, name) ?? ''),
+        isDefault: (name === 'memory.md' ? (readMemoryFile(this.memoryFile) ?? '') : (readPromptFile(this.promptDir, name) ?? ''))
+          === (readPromptFile(this.defaultPromptDir, name) ?? ''),
       })),
     }
   }
 
   savePrompt(name, content) {
-    writePromptFile(this.promptDir, name, content)
+    if (name === 'memory.md') writeMemoryFile(this.memoryFile, content)
+    else writePromptFile(this.promptDir, name, content)
     return { name, saved: true }
   }
 
   resetPrompt(name) {
-    resetPromptFile(this.defaultPromptDir, this.promptDir, name)
+    if (name === 'memory.md') resetMemoryFile(this.defaultPromptDir, this.memoryFile)
+    else resetPromptFile(this.defaultPromptDir, this.promptDir, name)
     return { name, reset: true }
   }
 
@@ -565,12 +595,11 @@ export class Engine {
       if (!freshId) throw new Error('DSH 创建新会话失败')
       const now = this.now()
       const dateKey = localDateKey(now)
-      const promptText = renderPrompt(this.promptDir, { date: now })
       this.store.touchUser(userKey, freshId, token, {
         sessionVersion: SESSION_VERSION,
         sessionDate: dateKey,
         historyKey: `${dateKey}-${crypto.randomUUID()}`,
-        promptHash: hashText(promptText),
+        promptHash: hashText(renderPrompt(this.promptDir, { date: now, memoryFile: this.memoryFile, includeMemory: false })),
         promptInjected: false,
       })
       this.userBySession.set(freshId, { from: userKey, token })

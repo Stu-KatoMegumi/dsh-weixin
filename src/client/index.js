@@ -116,7 +116,7 @@ window.__ModuleLoader__.load({
       { name: 'system-prompt.md', label: '系统设定', hint: '总纲与气泡契约（空行=新气泡），修改后下一条消息生效' },
       { name: 'soul.md', label: '人设与灵魂', hint: '性格、语气、价值观' },
       { name: 'rules.md', label: '行为规则', hint: '硬性规则与禁区' },
-      { name: 'memory.md', label: '背景记忆', hint: '静态背景知识，人工维护' },
+      { name: 'memory.md', label: '背景记忆', hint: 'LLM 根据用户意图自动新增、更新或删除，也可在此人工编辑' },
     ]
 
     function PromptEditor({ api, busy }) {
@@ -131,7 +131,7 @@ window.__ModuleLoader__.load({
       return h('div', { style: { marginTop: 22, borderTop: '1px solid var(--dsw-alias-border-strong, #e2e6ec)', paddingTop: 16 } },
         h('h3', { style: { margin: '0 0 4px', fontSize: 14 } }, 'Prompt 定制'),
         h('div', { style: { fontSize: 12, opacity: 0.7, marginBottom: 12 } },
-          `编辑目录：${prompts.dir}。首次启动已从项目默认文件复制，此处修改即时生效（下一条消息开始）。`),
+          `Prompt 编辑目录：${prompts.dir}；记忆文件：${prompts.memoryFile}。静态 Prompt 修改会创建新会话；记忆在下一次新会话注入。`),
         prompts.files.map(entry => {
           const meta = promptMeta.find(item => item.name === entry.name) || { name: entry.name, label: entry.name, hint: '' }
           return h('div', { key: entry.name, style: { marginBottom: 16 } },
